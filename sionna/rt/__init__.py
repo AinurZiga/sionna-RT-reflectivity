@@ -40,7 +40,6 @@ from .scattering_pattern import ScatteringPattern, LambertianPattern,\
 from .transmitter import Transmitter
 from .receiver import Receiver
 from .paths import Paths
-from .coverage_map import CoverageMap
 from .utils import rotation_matrix, rotate, theta_phi_from_unit_vec,\
                    r_hat, theta_hat, phi_hat, cross, dot,\
                    normalize, moller_trumbore, component_transform,\

@@ -1767,6 +1767,22 @@ class Reflection:
             # [num_targets, num_sources, max_num_paths, 2, 2]
             mat_t = mat_t*reduction_factor_
 
+        if not scattering and self.solver.obj_geom is not None and self.solver.obj_geom.is_glass_transmission:
+            glass_mat_t_slab = self.solver.obj_geom.los_glass_transmission(
+                                objects=objects,
+                                path_mask=paths.mask,
+                                k_hat=k_i[0],
+                                theta_t=theta_t,
+                                phi_t=phi_t,
+                                wavelength=self._scene.wavelength,
+                                dtype=self._dtype
+                                )
+
+            if self.solver.obj_geom.los_transmissions == 'two':
+                    glass_mat_t_slab = tf.linalg.matmul(glass_mat_t_slab, glass_mat_t_slab)
+
+            mat_t = tf.linalg.matmul(mat_t, glass_mat_t_slab)
+
         # Move to the targets frame
         # This is not done for scattering as we stop the last interaction point
         if not scattering:
@@ -1788,6 +1804,9 @@ class Reflection:
                                     tf.zeros_like(total_distance))
         # [num_targets, num_sources, max_num_paths, 2, 2]
         mat_t = tf.math.divide_no_nan(mat_t, total_distance)
+
+        nans_bool = tf.math.is_nan(tf.math.real(mat_t))
+        mat_t = tf.where(nans_bool, tf.zeros_like(mat_t, dtype=self._dtype), mat_t)
 
         # Set invalid paths to 0 and stores the transition matrices
         # Expand masks to broadcast with the field components

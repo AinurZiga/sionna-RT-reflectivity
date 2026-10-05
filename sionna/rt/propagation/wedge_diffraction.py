@@ -13,7 +13,8 @@ from ..utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
         compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
             cot, cross, sign, rotation_matrix, acos_diff
-from sionna.rt.diffraction_funcs import calc_angles, calc_angles_concave, my_wd_compute_fields
+from sionna.rt.diffraction_funcs import calc_angles, calc_angles_concave, my_wd_compute_fields, transition_func,\
+    my_wd_compute_fields2
 
 if TYPE_CHECKING:
     from ..solver_base import SolverBase
@@ -207,6 +208,10 @@ class WedgeDiffraction:
             mask = sources_valid_half_space
         elif case == 'rx':
             mask = targets_valid_half_space
+
+        ### planar egdes don't obstruct
+        is_edge = tf.gather(self.solver._is_edge, candidate_wedges)
+        mask = tf.where(is_edge, tf.fill(tf.shape(mask), True), mask)
 
         # Discard paths with no valid link
         # [max_num_paths]
@@ -580,9 +585,9 @@ class WedgeDiffraction:
         paths.path_types = tf.fill(paths.objects.shape, Paths.DIFFRACTED)
 
         return paths
-    
+
     def simple_compute_fields(self, wedge_idxs, s_wedge_prime_hat, s_wedge_hat, s_wedge_prime, s_wedge, mask,
-                              ell_ = None, coef_ell=None, new_coef_ell=None):
+                                ell_ = None, skip_F=False):
         # # [num_targets, num_sources, max_num_paths]
         valid_wedges_idx = tf.where(wedge_idxs == -1, 0, wedge_idxs)
 
@@ -601,7 +606,6 @@ class WedgeDiffraction:
         # [num_targets, num_sources, max_num_paths, 3]
         e_hat = tf.gather(self.solver._wedges_e_hat, valid_wedges_idx)
 
-
         # Extract surface normals
         # [num_targets, num_sources, max_num_paths, 3]
         n_0_hat = normals[...,0,:]
@@ -618,25 +622,15 @@ class WedgeDiffraction:
         w_phi_prime = tf.where(tf.experimental.numpy.isclose(w_phi_prime, 2*PI, atol=1e-2), 1e-3*tf.ones_like(w_phi_prime), w_phi_prime)
         w_phi = tf.where(tf.experimental.numpy.isclose(w_phi, 2*PI, atol=1e-2), 1e-3*tf.ones_like(w_phi), w_phi)
 
-        #r1, l = s_wedge_prime, s_wedge
-
-        # if get_coef_ell
-        #     w = tf.sqrt(r1 * r2 / ((r1+l) * (r2+l)))
-        #     coef_ell = (r1 + l) * (r2 + l) / (l * (r1 + r2))
-        # else:
-        #     coef_ell = None
-
         if ell_ is None:
             ell = s_wedge_prime * s_wedge / (s_wedge_prime + s_wedge) * tf.sin(w_beta_prime)**2
         else:
             ell = ell_ * tf.sin(w_beta_prime)**2
 
-        ## mat_t_wedge, new_coef_ell, tmp_w
-        mat_t_wedge, new_coef_ell, tmp_w = my_wd_compute_fields(w_phi_prime, w_phi, w_beta_prime, ell, s_wedge_prime, 
-                                           s_wedge, n, mask, self.solver._scene, coef_ell=coef_ell, new_coef_ell=new_coef_ell)
+        d_s, par_a_s = my_wd_compute_fields2(w_phi_prime, w_phi, w_beta_prime, ell, s_wedge_prime, 
+                                            s_wedge, n, mask, self.solver._scene, skip_F=skip_F)
         
-        return mat_t_wedge, new_coef_ell, tmp_w, (e_hat, w_beta_prime)
-    
+        return d_s, par_a_s, (e_hat, n_0_hat, n, w_phi_prime, w_phi, w_beta_prime)   
     
     def _diffraction_compute_fields(self, s_prime_hat, s_hat, n_0_hat, n_n_hat, e_hat, etas,
                                     scattering_coefficient, s_prime, s, n, mask, 
@@ -769,36 +763,16 @@ class WedgeDiffraction:
         # [num_targets, num_sources, max_num_paths]
         ell = s_prime*s/(s_prime + s) * tf.math.sin(beta_prime)**2
 
-        def f(x):
-            """F(x) Eq.(88) in [ITUR_P526]
-            """
-            sqrt_x = tf.sqrt(x)
-            sqrt_pi_2 = tf.cast(tf.sqrt(PI/2.), x.dtype)
-
-            # Fresnel integral
-            arg = sqrt_x/sqrt_pi_2
-            s = tf.math.special.fresnel_sin(arg)
-            c = tf.math.special.fresnel_cos(arg)
-            f = tf.complex(s, c)
-
-            zero = tf.cast(0, x.dtype)
-            one = tf.cast(1, x.dtype)
-            two = tf.cast(2, f.dtype)
-            factor = tf.complex(sqrt_pi_2*sqrt_x, zero)
-            factor = factor*tf.exp(tf.complex(zero, x))
-            res =  tf.complex(one, one) - two*f
-
-            return factor* res
-
         # [num_targets, num_sources, max_num_paths]
         cot_1 = tf.complex(cot_1, tf.zeros_like(cot_1))
         cot_2 = tf.complex(cot_2, tf.zeros_like(cot_2))
         cot_3 = tf.complex(cot_3, tf.zeros_like(cot_3))
         cot_4 = tf.complex(cot_4, tf.zeros_like(cot_4))
-        d_1 = d_mul*cot_1*f(k*ell*a_p(phi_m, n))
-        d_2 = d_mul*cot_2*f(k*ell*a_m(phi_m, n))
-        d_3 = d_mul*cot_3*f(k*ell*a_p(phi_p, n))
-        d_4 = d_mul*cot_4*f(k*ell*a_m(phi_p, n))
+        
+        d_1 = d_mul*cot_1 * transition_func(k*ell*a_p(phi_m, n))
+        d_2 = d_mul*cot_2 * transition_func(k*ell*a_m(phi_m, n))
+        d_3 = d_mul*cot_3 * transition_func(k*ell*a_p(phi_p, n))
+        d_4 = d_mul*cot_4 * transition_func(k*ell*a_m(phi_p, n))
 
         if in_local_coordinates:
             d_soft = d_1 + d_2 - d_3 - d_4
@@ -825,14 +799,6 @@ class WedgeDiffraction:
         d_2 = tf.reshape(d_2, tf.concat([tf.shape(d_2), [1,1]], axis=0))
         d_3 = tf.reshape(d_3, tf.concat([tf.shape(d_3), [1,1]], axis=0))
         d_4 = tf.reshape(d_4, tf.concat([tf.shape(d_4), [1,1]], axis=0))
-
-        # # [num_targets, num_sources, max_num_paths]
-        # spreading_factor = tf.sqrt(s_prime / (s*(s_prime + s)))
-        # spreading_factor = tf.complex(spreading_factor,
-        #                               tf.zeros_like(spreading_factor))
-        # #_spreading_factor = spreading_factor
-        # # [num_targets, num_sources, max_num_paths, 1, 1]
-        # spreading_factor = tf.reshape(spreading_factor, tf.shape(d_1))
 
         # [num_targets, num_sources, max_num_paths, 2, 2]
         mat_t = (d_1+d_2)*tf.eye(2,2, batch_shape=tf.shape(r_0)[:3],
@@ -1031,11 +997,6 @@ class WedgeDiffraction:
         # [num_targets, num_sources, max_num_paths, 3]
         n_n_hat = normals[...,1,:]
 
-        # s_prime_hat, s_prime = normalize(diff_points-sources) # l_hat, l
-        # s_hat, s = normalize(targets-diff_points)             # r2_hat, r
-
-        #_etas = etas[1]
-        #_scattering_coefficient = scattering_coefficient[1]
         _theta_t, _phi_t = theta_phi_from_unit_vec(k_i[1])
 
         mat_t_diff = self._diffraction_compute_fields(l_hat, r2_hat, n_0_hat, n_n_hat, e_hat, etas_diff,
@@ -1108,9 +1069,6 @@ class WedgeDiffraction:
         l_hat, l = normalize(refl_points - diff_points)
         r2_hat, r2 = normalize(targets - refl_points)
 
-        # _theta_r, _phi_r = theta_phi_from_unit_vec(-r2_hat)
-        # _theta_t, _phi_t = theta_phi_from_unit_vec(r1_hat)
-
         #### 1) Wedge Diffraction
         # [num_targets, num_sources, max_num_paths, 2, 3]
         normals = tf.gather(self.solver._wedges_normals, valid_wedges_idx, axis=0)
@@ -1148,58 +1106,5 @@ class WedgeDiffraction:
         ### 3) total field
         sf = 1 / tf.sqrt(r1 * (r2+l) * (r1+l+r2))
         mat_t = tf.multiply(mat_t_diff, mat_t_refl) * tf.cast(sf, self.solver._dtype)[..., None, None]
-
-        ###################################################
-
-        # r1_hat, r1 = normalize(refl_points - targets)
-        # l_hat, l = normalize(diff_points - refl_points)
-        # r2_hat, r2 = normalize(sources - diff_points)
-
-        # #### 1) Reflection
-        # # [max_depth, num_targets, num_sources, max_num_paths]
-        # reduction_factor_refl = tf.sqrt(1 - scattering_coefficient_refl**2)
-        # reduction_factor_refl = tf.complex(reduction_factor_refl, tf.zeros_like(reduction_factor_refl))
-        # _k_t = r1_hat # r1_hat
-        # _k_r = l_hat # l_hat
-        # mat_t_refl = self.solver.solver_reflection._foo(refl_idxs, _k_t, _k_r, _normals, reduction_factor_refl, etas_refl)
-
-        # #### 2) Wedge Diffraction
-        # # [num_targets, num_sources, max_num_paths]
-        # # valid_wedges_idx = tf.where(wedge_idxs == -1, 0, wedge_idxs)
-
-        # # [num_targets, num_sources, max_num_paths, 2, 3]
-        # normals = tf.gather(self.solver._wedges_normals, valid_wedges_idx, axis=0)
-
-        # # Compute the wedges angle
-        # # [num_targets, num_sources, max_num_paths]
-        # cos_wedges_angle = dot(normals[..., 0, :], normals[..., 1, :], clip=True)
-        # wedges_angle = PI - tf.math.acos(cos_wedges_angle)
-        # n = (2.*PI-wedges_angle)/PI
-
-        # is_concave_wedge = tf.gather(self.solver._is_concave_wedge, valid_wedges_idx)
-        # n = tf.where(is_concave_wedge, wedges_angle / PI, n)
-
-        # # [num_targets, num_sources, max_num_paths, 3]
-        # e_hat = tf.gather(self.solver._wedges_e_hat, valid_wedges_idx)
-
-        # # [num_targets, num_sources, max_num_paths, 3]
-        # n_0_hat = normals[...,0,:]
-        # # [num_targets, num_sources, max_num_paths, 3]
-        # n_n_hat = normals[...,1,:]
-
-        # # s_prime_hat, s_prime = normalize(diff_points-sources) # l_hat, l
-        # # s_hat, s = normalize(targets-diff_points)             # r2_hat, r
-
-        # #_etas = etas[1]
-        # #_scattering_coefficient = scattering_coefficient[1]
-        # _theta_t, _phi_t = theta_phi_from_unit_vec(l_hat)
-        # _theta_r, _phi_r = theta_phi_from_unit_vec(r2_hat)
-
-        # mat_t_diff = self._diffraction_compute_fields(l_hat, r2_hat, n_0_hat, n_n_hat, e_hat, etas_diff,
-        #                             scattering_coefficient_diff, r1+l, r2, n, mask, _theta_t, _phi_t, _theta_r, _phi_r, skip_sf=True)
-
-        # ### 3) total field
-        # sf = 1 / tf.sqrt(r2 * (r1+l) * (r1+l+r2))
-        mat_t = tf.multiply(mat_t_refl, mat_t_diff) * tf.cast(sf, self.solver._dtype)[..., None, None]
 
         return mat_t

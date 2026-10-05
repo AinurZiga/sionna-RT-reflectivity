@@ -92,15 +92,6 @@ class Paths:
     SCATTERED = 3
     VERTEX_DIFFRACTED = 4
 
-    # RE = 12
-    # ER = 21
-    # RV = 14
-    # VR = 41
-    # EE = 22
-    # EV = 24
-    # VE = 42
-    # VV = 44
-
     REFL_DIFF = 5
     DOUBLE_DIFF = 6
     VD_REFL = 7
@@ -1007,8 +998,9 @@ class Paths:
             self._min_tau = tf.zeros_like(tau)
         else:
             zero = tf.zeros((), tau.dtype)
-            inf = tf.cast(np.inf, tau.dtype)
-            tau = tf.where(tau < zero, inf, tau)
+            # inf = tf.cast(np.inf, tau.dtype)
+            large = tf.constant(1e9, tau.dtype)
+            tau = tf.where(tau < zero, large, tau)
             if self._scene.synthetic_array:
                 # [1, num_rx, num_tx, 1]
                 min_tau = tf.reduce_min(tau, axis=3, keepdims=True)
@@ -1151,14 +1143,14 @@ class Paths:
             new_paths.phi_t = tf.gather(self.phi_t, indices, axis=axis)
             new_paths.theta_r = tf.gather(self.theta_r, indices, axis=axis)
             new_paths.phi_r = tf.gather(self.phi_r, indices, axis=axis)
+            new_paths.tau = tf.gather(self.tau, indices, axis=axis)
         else:
             new_paths.mask = tf.gather(self.mask, indices, axis=axis-1)
             new_paths.theta_t = tf.gather(self.theta_t, indices, axis=axis-1)
             new_paths.phi_t = tf.gather(self.phi_t, indices, axis=axis-1)
             new_paths.theta_r = tf.gather(self.theta_r, indices, axis=axis-1)
             new_paths.phi_r = tf.gather(self.phi_r, indices, axis=axis-1)
-
-        #new_paths.targets_sources_mask = tf.gather(self.targets_sources_mask, indices, axis=axis-1)
+            new_paths.tau = tf.gather(self.tau, indices, axis=axis-1)
 
         return new_paths
 

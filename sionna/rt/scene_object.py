@@ -14,7 +14,7 @@ from .radio_material import RadioMaterial
 import drjit as dr
 import mitsuba as mi
 from . import scene as scene_module
-from .utils import mi_to_tf_tensor, angles_to_mitsuba_rotation, normalize,\
+from .utils import mi_to_tf_tensor, angles_to_mitsuba_rotation, normalize, rotation_matrix,\
     theta_phi_from_unit_vec
 from sionna.constants import PI
 
@@ -262,128 +262,75 @@ class SceneObject(Object):
     def position(self, new_position):
         return self._position(new_position)
 
-    def _position(self, new_position, is_update=True):
-        ## Update Mitsuba vertices
+    def _set_mesh_vertices(self, vertices, is_update=True):
+        """Update the object's vertices in TensorFlow and Mitsuba."""
+        solver = self._scene.solver_paths
+        vertices = tf.cast(vertices, solver._rdtype)
 
-        # Scene parameters
-        scene_params = self._scene.mi_scene_params
-        # Real dtype
+        shapes = solver._mi_scene.shapes()
+        shape_idx = int(solver._shape_indices[self.object_id])
+        start = sum(shape.vertex_count() for shape in shapes[:shape_idx])
+        indices = tf.range(start, start + self._mi_shape.vertex_count(), dtype=tf.int32)
+
+        solver._vertices.scatter_nd_update(indices[:, None], vertices)
+
+        params = self._scene.mi_scene_params
+        params[f"{self._mi_shape.id()}.vertex_positions"] = self._mi_scalar_t(tf.reshape(vertices, [-1]))
+
+        if is_update:
+            params.update()
+            self._refresh_geometry()
+            self._scene.scene_geometry_updated()
+
+    def _refresh_geometry(self):
+        """Refresh derived geometry and diffraction caches."""
+        solver = self._scene.solver_paths
+        solver._update_geometry()
+
+        # DoubleDiffraction keeps references to derived geometry tensors.
+        dd = solver.double_diffraction
+        for name in (
+            "_wedges_origin", "_wedges_normals", "_wedges_e_hat", "_wedges_objects",
+            "_is_edge", "_wedges_length", "_primitives_2_wedges",
+        ):
+            setattr(dd, name, getattr(solver, name))
+        dd._facet_normals = solver._normals
+        dd.dd_pairs_coplanar = None
+
+        obj_geom = solver.obj_geom
+        if obj_geom is not None:
+            obj_geom._update_geometry()
+            if solver.vertex_diffraction.is_setup:
+                solver.vertex_diffraction.set_objects_geometry(obj_geom)
+            dd.set_objects_geometry(obj_geom)
+
+    def _position(self, new_position, is_update=True):
         rdtype = self._scene.dtype.real_dtype
         new_position = tf.cast(new_position, rdtype)
-        # [num_vertices*3]
-        vertices = scene_params[f'mesh-{self.name}.vertex_positions']
-        # [num_vertices,3]
-        vertices = mi_to_tf_tensor(vertices, rdtype)
-        vertices = tf.reshape(vertices, [-1, 3])
-        # [3]
-        position = self.position
-        # [3]
-        translation_vector = new_position - position
-        # [1,3]
-        translation_vector = tf.expand_dims(translation_vector, axis=0)
-        # [num_vertices,3]
-        translated_vertices = vertices + translation_vector
-        # Cast to Mitsuba type to object the Mitsuba scene
-        fltn_translated_vertices = tf.reshape(translated_vertices, [-1])
-        fltn_translated_vertices = self._mi_scalar_t(fltn_translated_vertices)
-        #
-        scene_params[f'mesh-{self.name}.vertex_positions'] =\
-            fltn_translated_vertices
-        
-        if is_update:
-            scene_params.update()
 
-        ## Update Sionna vertices
+        params = self._scene.mi_scene_params
+        key = f"{self._mi_shape.id()}.vertex_positions"
+        vertices = tf.reshape(mi_to_tf_tensor(params[key], rdtype), [-1, 3])
+        vertices = vertices + (new_position - self.position)
 
-        obj_id = self.object_id
-        mi_shape = self._mi_shape
-        solver_paths = self._scene.solver_paths
+        self._set_mesh_vertices(vertices, is_update)
 
-        shape_ind = solver_paths.shape_indices[obj_id]
-        prim_offset = solver_paths.prim_offsets[shape_ind]
+    def _rotate(self, new_orient, origin=None, is_update=True):
+        rdtype = self._scene.dtype.real_dtype
+        new_orient = tf.cast(new_orient, rdtype)
+        origin = self.position if origin is None else tf.cast(origin, rdtype)
 
-        face_indices3 = mi_shape.face_indices(dr.arange(mi.UInt32,
-                                                        mi_shape.face_count()))
-        # Flatten. This is required for calling vertex_position
-        # [n_prims*3]
-        face_indices = dr.ravel(face_indices3)
-        # Get vertices coordinates
-        # [n_prims*3, 3]
-        vertex_coords = mi_shape.vertex_position(face_indices)
-        # Cast to TensorFlow type
-        # [n_prims*3, 3]
-        vertex_coords = mi_to_tf_tensor(vertex_coords, rdtype)
-        # Unflatten
-        # [n_prims, vertices per triangle : 3, 3]
-        vertex_coords = tf.reshape(vertex_coords, [mi_shape.face_count(), 3, 3])
-        # Update the tensor storing the primitive vertices
-        sl = tf.range(prim_offset, prim_offset + mi_shape.face_count(),
-                    dtype=tf.int32)
-        sl = tf.expand_dims(sl, axis=1)
-        solver_paths.primitives.scatter_nd_update(sl, vertex_coords)
+        params = self._scene.mi_scene_params
+        key = f"{self._mi_shape.id()}.vertex_positions"
+        vertices = tf.reshape(mi_to_tf_tensor(params[key], rdtype), [-1, 3])
 
-        ## Update Sionna wedges
+        new_rotation = rotation_matrix(new_orient)
+        old_rotation = rotation_matrix(self._orientation)
+        rotation = tf.linalg.matmul(new_rotation, old_rotation, transpose_b=True)
+        vertices = tf.linalg.matmul(vertices - origin, rotation, transpose_b=True) + origin
 
-        wedges_objects = solver_paths.wedges_objects
-        wedges_origin = solver_paths.wedges_origin
-
-        # Indices of the wedges corresponding to this object
-        # [num_wedges]
-        wedges_ind, _ = tf.unique(tf.where(wedges_objects == obj_id)[:,0])
-
-        # Corresponding origins
-        # [num_wedges, 3]
-        wedges_origin = tf.gather(wedges_origin, wedges_ind, axis=0)
-
-        # Translates the wedges
-        # [num_wedges, 3]
-        wedges_origin += translation_vector
-
-        # Updates the wedges
-        wedges_ind = tf.expand_dims(wedges_ind, axis=1)
-        solver_paths.wedges_origin.scatter_nd_update(wedges_ind, wedges_origin)
-
-        if self._scene.solver_paths.vertex_diffraction.is_setup:
-        #if self._scene.solver_paths.obj_geom is not None:
-            ### Update vertex diffraction attributes
-            vertices_2_objects = solver_paths.vertex_diffraction.vertices_2_objects_sionna
-            vertex_wedges_2_objects = solver_paths.vertex_diffraction.vertex_wedges_2_objects
-            # vertices_2_objects = solver_paths.obj_geom.vertices_2_objects_sionna
-            #vertex_wedges_2_objects = solver_paths.obj_geometry.vertex_wedges_2_objects
-
-            # Indices of the vertices corresponding to this object
-            # [num_vertices]
-            vertices_ind = tf.where(vertices_2_objects == obj_id)[:, 0]
-
-            # Indices of the vertex wedges
-            # [num_vertex_wedges]
-            vertex_wedges_ind = tf.where(vertex_wedges_2_objects == obj_id)[:, 0]
-
-            # Get corresponding vertices and translate them
-            vd_vertices = tf.gather(solver_paths.vertex_diffraction._vertices, vertices_ind)
-            # vd_vertices = tf.gather(solver_paths.obj_geom._vertices, vertices_ind)
-            vd_vertices += translation_vector
-
-
-            # Corresponding origins
-            vertex_wedges_origin = tf.gather(solver_paths.vertex_diffraction._vertex_edges_origin, vertex_wedges_ind)
-            vertex_wedges_origin += translation_vector
-
-            # Updates
-            vertices_ind = tf.expand_dims(vertices_ind, axis=1)
-            vertex_wedges_ind = tf.expand_dims(vertex_wedges_ind, axis=1)
-            solver_paths.vertex_diffraction._vertices = tf.tensor_scatter_nd_update(solver_paths.vertex_diffraction._vertices, \
-                                                                            vertices_ind, vd_vertices)
-
-            # solver_paths.obj_geom._vertices = tf.tensor_scatter_nd_update(solver_paths.obj_geom._vertices, \
-            #                                                                 vertices_ind, vd_vertices)
-            solver_paths.vertex_diffraction._vertex_edges_origin = tf.tensor_scatter_nd_update(\
-                        solver_paths.vertex_diffraction._vertex_edges_origin, vertex_wedges_ind, vertex_wedges_origin)
-
-
-        # Trigger scene callback
-        self._scene.scene_geometry_updated()
-        
+        self._orientation = new_orient
+        self._set_mesh_vertices(vertices, is_update)
 
     @property
     def orientation(self):
@@ -397,186 +344,6 @@ class SceneObject(Object):
     @orientation.setter
     def orientation(self, new_orient):
         return self._rotate(new_orient)
-
-    def _rotate(self, new_orient, origin=None, is_update=True):
-        # Real dtype
-        rdtype = self._scene.dtype.real_dtype
-        new_orient = tf.cast(new_orient, rdtype)
-
-        if tf.experimental.numpy.allclose(new_orient, tf.zeros(3, dtype=rdtype)):
-            return
-
-        # Build the transformtation corresponding to the new rotation
-        new_rotation = angles_to_mitsuba_rotation(new_orient)
-
-        # Invert the current orientation
-        cur_rotation = angles_to_mitsuba_rotation(self._orientation.numpy())
-        inv_cur_rotation = cur_rotation.inverse()
-
-        if origin is None:
-            origin = self.position.numpy()
-
-        # Build the transform.
-        # The object is first translated to the origin, then rotated, then
-        # translated back to its current position
-        # transform =  (  self._mi_transform_t.translate(self.position.numpy())
-        #               @ new_rotation
-        #               @ inv_cur_rotation
-        #               @ self._mi_transform_t.translate(-self.position.numpy()) )
-        
-        transform =  (  self._mi_transform_t.translate(origin)
-                      @ new_rotation
-                      @ inv_cur_rotation
-                      @ self._mi_transform_t.translate(-origin) )
-
-        ## Update Mitsuba vertices
-
-        # Scene parameters
-        scene_params = self._scene.mi_scene_params
-        # [num_vertices*3]
-        vertices = scene_params[f'mesh-{self.name}.vertex_positions']
-        # [num_vertices,3]
-        vertices = dr.unravel(self._mi_point_t, vertices)
-        # Apply the transform
-        vertices = transform.transform_affine(vertices)
-        # Cast to Mitsuba type to object the Mitsuba scene
-        fltn_vertices = tf.reshape(vertices, [-1])
-        fltn_vertices = tf.cast(fltn_vertices, tf.float32)
-        scene_params[f'mesh-{self.name}.vertex_positions'] = fltn_vertices
-
-        if is_update:
-            scene_params.update()
-
-        ## Update Sionna vertices
-
-        obj_id = self.object_id
-        mi_shape = self._mi_shape
-        solver_paths = self._scene.solver_paths
-
-        shape_ind = solver_paths.shape_indices[obj_id]
-        prim_offset = solver_paths.prim_offsets[shape_ind]
-
-        face_indices3 = mi_shape.face_indices(dr.arange(mi.UInt32,
-                                                        mi_shape.face_count()))
-        # Flatten. This is required for calling vertex_position
-        # [n_prims*3]
-        face_indices = dr.ravel(face_indices3)
-        # Get vertices coordinates
-        # [n_prims*3, 3]
-        vertex_coords = mi_shape.vertex_position(face_indices)
-        # Cast to TensorFlow type
-        # [n_prims*3, 3]
-        vertex_coords = mi_to_tf_tensor(vertex_coords, rdtype)
-        # Unflatten
-        # [n_prims, vertices per triangle : 3, 3]
-        vertex_coords = tf.reshape(vertex_coords, [mi_shape.face_count(), 3, 3])
-        # Update the tensor storing the primitive vertices
-        sl = tf.range(prim_offset, prim_offset + mi_shape.face_count(),
-                    dtype=tf.int32)
-        sl = tf.expand_dims(sl, axis=1)
-        solver_paths.primitives.scatter_nd_update(sl, vertex_coords)
-
-        ## Update Sionna normals
-
-        # Get vertices coordinates
-        # [n_prims, 3]
-        normals = solver_paths.normals.gather_nd(sl)
-        # Cast to Mitsuba Vector
-        # [n_prims, 3]
-        normals = self._mi_vec_t(normals)
-        # Rotate the normals
-        normals = transform.transform_affine(normals)
-        # Cast to Tensorflow type
-        # [n_prims, 3]
-        normals = mi_to_tf_tensor(normals, rdtype)
-        # Update the tensor storing the primitive vertices
-        solver_paths.normals.scatter_nd_update(sl, normals)
-
-        ## Update Sionna wedges
-
-        wedges_objects = solver_paths.wedges_objects
-        wedges_origin = solver_paths.wedges_origin
-        wedges_e_hat = solver_paths.wedges_e_hat
-        wedges_normals = solver_paths.wedges_normals
-
-        # Indices of the wedges corresponding to this object
-        # [num_wedges]
-        wedges_ind, _ = tf.unique(tf.where(wedges_objects == obj_id)[:,0])
-
-        # Corresponding origins, e_hat, and normals
-        # [num_wedges, 3]
-        wedges_origin = tf.gather(wedges_origin, wedges_ind, axis=0)
-        # [num_wedges, 3]
-        wedges_e_hat = tf.gather(wedges_e_hat, wedges_ind, axis=0)
-        # [num_wedges, 3]
-        wedges_normals = tf.gather(wedges_normals, wedges_ind, axis=0)
-        # [num_wedges*2, 3]
-        wedges_normals = tf.reshape(wedges_normals, [-1, 3])
-
-        # Cast to Mitsuba types
-        # [num_wedges, 3]
-        wedges_origin = self._mi_point_t(wedges_origin)
-        # [num_wedges, 3]
-        wedges_e_hat = self._mi_vec_t(wedges_e_hat)
-        # [num_wedges*2, 3]
-        wedges_normals = self._mi_vec_t(wedges_normals)
-
-        # Rotate all quantities
-        # [num_wedges, 3]
-        wedges_origin = transform.transform_affine(wedges_origin)
-         # [num_wedges, 3]
-        wedges_e_hat = transform.transform_affine(wedges_e_hat)
-         # [num_wedges*2, 3]
-        wedges_normals = transform.transform_affine(wedges_normals)
-
-        # Cast to Tensorflow type
-        # [num_wedges, 3]
-        wedges_origin = mi_to_tf_tensor(wedges_origin, rdtype)
-        # [num_wedges, 3]
-        wedges_e_hat = mi_to_tf_tensor(wedges_e_hat, rdtype)
-        # [num_wedges*2, 3]
-        wedges_normals = mi_to_tf_tensor(wedges_normals, rdtype)
-        # [num_wedges, 2, 3]
-        wedges_normals = tf.reshape(wedges_normals, [-1, 2, 3])
-
-        # Updates the wedges
-        wedges_ind = tf.expand_dims(wedges_ind, axis=1)
-        solver_paths.wedges_origin.scatter_nd_update(wedges_ind, wedges_origin)
-        solver_paths.wedges_e_hat.scatter_nd_update(wedges_ind, wedges_e_hat)
-        solver_paths.wedges_normals.scatter_nd_update(wedges_ind,
-                                                      wedges_normals)
-        
-        ### for VD
-        if self._scene.solver_paths.vertex_diffraction.is_setup:
-            vertices_2_objects = solver_paths.vertex_diffraction.vertices_2_objects_sionna
-            vertex_wedges_2_objects = solver_paths.vertex_diffraction.vertex_wedges_2_objects
-            # gather all
-            # [num_vertices]
-            vertices_ind = tf.where(vertices_2_objects == obj_id)[:, 0]
-            vertices_2_objects = solver_paths.vertex_diffraction.vertices_2_objects_sionna
-            vertex_wedges_2_objects = solver_paths.vertex_diffraction.vertex_wedges_2_objects  # sionna objects
-            vertex_wedges_ind = tf.where(vertex_wedges_2_objects == obj_id)[:, 0]
-            vd_vertices = tf.gather(solver_paths.vertex_diffraction._vertices, vertices_ind)
-            vertex_wedges_origin = tf.gather(solver_paths.vertex_diffraction._vertex_edges_origin, vertex_wedges_ind)
-
-            # Transform all
-            vd_vertices = transform.transform_affine(vd_vertices)
-            vertex_wedges_origin = transform.transform_affine(vertex_wedges_origin)
-
-            # Updates
-            vertices_ind = tf.expand_dims(vertices_ind, axis=1)
-            vertex_wedges_ind = tf.expand_dims(vertex_wedges_ind, axis=1)
-            solver_paths.vertex_diffraction._vertices = tf.tensor_scatter_nd_update(solver_paths.vertex_diffraction._vertices, \
-                                                                            vertices_ind, vd_vertices)
-            solver_paths.vertex_diffraction._vertex_edges_origin = \
-                tf.tensor_scatter_nd_update(solver_paths.vertex_diffraction._vertex_edges_origin, \
-                                                                                               vertex_wedges_ind, vertex_wedges_origin)
-
-
-        self._orientation = new_orient
-
-        # Trigger scene callback
-        self._scene.scene_geometry_updated()
 
     def look_at(self, target):
         # pylint: disable=line-too-long
