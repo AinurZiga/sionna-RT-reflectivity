@@ -61,7 +61,8 @@ class Receiver(RadioDevice):
                  orientation=(0.,0.,0.),
                  look_at=None,
                  color=(0.153, 0.682, 0.375),
-                 dtype=tf.complex64):
+                 dtype=tf.complex64,
+                 display_radius=None):
 
         # Initialize the base class Object
         super().__init__(name=name,
@@ -69,4 +70,5 @@ class Receiver(RadioDevice):
                          orientation=orientation,
                          look_at=look_at,
                          color=color,
-                         dtype=dtype)
+                         dtype=dtype,
+                         display_radius=display_radius)
