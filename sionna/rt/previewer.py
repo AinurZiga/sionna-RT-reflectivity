@@ -154,7 +154,7 @@ class InteractiveDisplay:
         #     self._plot_points(p, persist=False, colors=albedo,
         #                       radius=radius)
 
-        default_radius = max(0.005 * sc, 1)
+        default_radius = 0.2 # max(0.005 * sc, 1)
         groups = {}
 
         for devices, positions in ((scene.transmitters, tx_positions), (scene.receivers, rx_positions)):

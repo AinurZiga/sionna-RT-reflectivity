@@ -225,15 +225,17 @@ class WedgeDiffraction:
         wedges_indices = tf.where(mask, wedges_indices, -1)
 
         return wedges_indices
-    
 
     def _compute_diffraction_points(self, targets, sources, wedges_indices):
         r"""
-        Compute the interaction points on the wedges that minimizes the path
-        length, and masks the wedges for which the interaction points is
-        not on the finite wedge.
+        Compute stationary diffraction points on finite wedges.
 
-        Note: This calculation is done in double-precision (64bit).
+        The point minimizes the total source-to-edge-to-target path length.
+        Candidates whose stationary points lie outside the finite edge are
+        discarded. Wedges unused by all links are removed.
+
+        The calculation is performed in double precision, then the resulting
+        points are converted back to self._rdtype.
 
         Input
         ------
@@ -244,154 +246,75 @@ class WedgeDiffraction:
             Coordinates of the sources.
 
         wedges_indices : [num_targets, num_sources, max_num_paths], tf.int
-            Indices of the wedges that interacted with the diffracted paths
+            Candidate wedge indices. Invalid candidates have index -1.
 
         Output
         -------
-        wedges_indices : [num_targets, num_sources, max_num_paths], tf.int
-            Indices of the wedges that interacted with the diffracted paths
+        wedges_indices : [num_targets, num_sources, num_used_wedges], tf.int
+            Wedge indices after discarding invalid candidates and unused wedges.
 
-        vertices : [num_targets, num_sources, max_num_paths, 3], tf.float
-            Coordinates of the interaction points on the intersected wedges
+        vertices : [num_targets, num_sources, num_used_wedges, 3], tf.float
+            Stationary interaction points, with dtype self._rdtype.
+            Points corresponding to index -1 must be ignored.
         """
 
-        sources = tf.cast(sources, tf.float64)
-        targets = tf.cast(targets, tf.float64)
+        sources = tf.cast(sources, tf.float64)[None, :, None, :]
+        targets = tf.cast(targets, tf.float64)[:, None, None, :]
 
-        # On CPU, indexing with -1 does not work. Hence we replace -1 by 0.
-        # This makes no difference on the resulting paths as such paths
-        # are not flagged as active.
-        # [max_num_paths]
-        valid_wedges_idx = tf.where(wedges_indices == -1, 0, wedges_indices)
+        # Replace invalid indices before gathering; their paths remain masked.
+        valid_wedges_idx = tf.where(wedges_indices >= 0, wedges_indices, 0)
+        origins = tf.cast(tf.gather(self.solver._wedges_origin, valid_wedges_idx), tf.float64)
+        e_hat = tf.cast(tf.gather(self.solver._wedges_e_hat, valid_wedges_idx), tf.float64)
+        lengths = tf.cast(tf.gather(self.solver._wedges_length, valid_wedges_idx), tf.float64)
 
-        # [max_num_paths, 3]
-        origins = tf.gather(self.solver._wedges_origin, valid_wedges_idx)
-        origins = tf.cast(origins, tf.float64)
-        # [1, 1, max_num_paths, 3]
+        # Float32 unit vectors are not exactly normalized after casting.
+        e_hat = tf.math.divide_no_nan(e_hat, tf.norm(e_hat, axis=-1, keepdims=True))
         origins = expand_to_rank(origins, 4, 0)
-        # [max_num_paths, 3]
-        e_hat = tf.gather(self.solver._wedges_e_hat, valid_wedges_idx)
-        e_hat = tf.cast(e_hat, tf.float64)
-        # [1, 1, max_num_paths, 3]
         e_hat = expand_to_rank(e_hat, 4, 0)
-        # [max_num_paths]
-        wedges_length = tf.gather(self.solver._wedges_length, valid_wedges_idx)
-        wedges_length = tf.cast(wedges_length, tf.float64)
-        # [1, 1, max_num_paths]
-        wedges_length = expand_to_rank(wedges_length, 3, 0)
+        lengths = expand_to_rank(lengths, 3, 0)
 
-        # Expand to broadcast with paths and sources/targets
-        # [1, num_sources, 1, 3]
-        sources = tf.expand_dims(tf.expand_dims(sources, axis=1), axis=0)
-        # [num_targets, 1, 1, 3]
-        targets = insert_dims(targets, 2, 1)
-        # Sources/Targets vectors
-        # [1, num_sources, max_num_paths, 3]
-        u_t = origins - sources
-        # [num_targets, 1, max_num_paths, 3]
-        u_r = origins - targets
+        source_offsets = sources - origins
+        target_offsets = targets - origins
 
-        # Quantites required for the computation of the interaction points
-        # [1, num_sources, max_num_paths]
-        a = dot(u_t,e_hat)
-        # [num_targets, 1, max_num_paths]
-        b = dot(u_r, e_hat)
-        # [1, num_sources, max_num_paths]
-        c = dot(u_t, u_t)
-        # [num_targets, 1, max_num_paths]
-        d = dot(u_r, u_r)
+        z_source = dot(source_offsets, e_hat)
+        z_target = dot(target_offsets, e_hat)
+        source_perp = source_offsets - z_source[..., None] * e_hat
+        target_perp = target_offsets - z_target[..., None] * e_hat
 
-        # Quantites required for the computation of the interaction points
-        # [num_targets, num_sources, max_num_paths]
-        alpha = -tf.square(a) + tf.square(b) + c - d
-        beta = 2.*(a*tf.square(b) - b*tf.square(a) + b*c - a*d)
-        gamma = tf.square(b)*c - tf.square(a)*d
+        def perpendicular_distance(vector):
+            # Avoid evaluating SqrtGrad at zero for axial configurations.
+            squared = tf.reduce_sum(tf.square(vector), axis=-1)
+            positive = squared > 0.0
+            safe_squared = tf.where(positive, squared, tf.ones_like(squared))
+            return tf.where(positive, tf.sqrt(safe_squared), tf.zeros_like(squared))
 
-        # Normalized quantites to improve numerical preicion, only valid if
-        # alpha != 0
-        # [num_targets, num_sources, max_num_paths]
-        beta_norm = tf.math.divide_no_nan(beta, alpha)
-        gamma_norm = tf.math.divide_no_nan(gamma, alpha)
-        delta = tf.square(beta_norm) - 4.*gamma_norm
+        h_source = perpendicular_distance(source_perp)
+        h_target = perpendicular_distance(target_perp)
+        h_sum = h_source + h_target
 
-        # Because of numerical imprecision, delta could be slighlty smaller than
-        # 0
-        # [num_targets, num_sources, max_num_paths]
-        delta = tf.where(tf.less(delta, tf.zeros_like(delta)),
-                         tf.zeros_like(delta), delta)
+        # Direct stationary-point formula, without a quadratic equation.
+        t_min = tf.math.divide_no_nan(z_source * h_target + z_target * h_source, h_sum)
 
+        # If both endpoints lie on the edge line, any point between their
+        # projections minimizes the path length. Choose one on the finite edge
+        # whenever the two intervals overlap.
+        axial_low = tf.maximum(tf.minimum(z_source, z_target), tf.zeros_like(h_sum))
+        axial_high = tf.minimum(tf.maximum(z_source, z_target), lengths)
+        axial_valid = axial_low <= axial_high
+        axial_t = 0.5 * (axial_low + axial_high)
+        t_min = tf.where(h_sum > 0.0, t_min, axial_t)
 
-        # Four possible outcomes depending on the value of the previous
-        # quantities.
-        # Values of t that minimizes the path length for each outcome.
-        # [num_targets, num_sources, max_num_paths]
-        t_min_1 = -a
-        t_min_2 = -tf.math.divide_no_nan(gamma, beta)
-        t_min_3 = (-beta_norm + tf.sqrt(delta))*0.5
-        t_min_4 = (-beta_norm - tf.sqrt(delta))*0.5
-        # Condition for each outcome to be selected
-        # If a == b and c == d, then set to t_min_1
-        # [num_targets, num_sources, max_num_paths]
-        cond_1 = tf.logical_and(tf.experimental.numpy.isclose(a, b),
-                                tf.experimental.numpy.isclose(c, d))
-        # If cond_1 does not hold and alpha == 0, then set to t_min_2
-        # [num_targets, num_sources, max_num_paths]
-        cond_2 = tf.logical_and(tf.logical_not(cond_1),
-                                tf.experimental.numpy.isclose(alpha,
-                                tf.zeros_like(alpha)))
-        # If neither cond_1 nor cond_2 holds, then set to t_min_3 or t_min_4
-        # depending on the signs of t+a and t+b
-        # [num_targets, num_sources, max_num_paths]
-        not_cond_12 = tf.logical_and(tf.logical_not(cond_1),
-                                     tf.logical_not(cond_2))
-        # [num_targets, num_sources, max_num_paths]
-        t_min_3a = t_min_3 + a
-        t_min_3b = t_min_3 + b
-        # [num_targets, num_sources, max_num_paths]
-        cond_3 = tf.logical_and(not_cond_12,
-                tf.less_equal(tf.sign(t_min_3a)*tf.sign(t_min_3b), 0.0))
-        # If none of conditions 1, 2, or 3 are satisfied, then all is left is
-        # t_min_4
-        # [num_targets, num_sources, max_num_paths]
-        cond_4 = tf.logical_and(not_cond_12, tf.logical_not(cond_3))
-        # Assign t_min according to the previously computed conditions
-        # [num_targets, num_sources, max_num_paths]
-        t_min = tf.zeros_like(cond_1, tf.float64)
-        t_min = tf.where(cond_1, t_min_1, t_min)
-        t_min = tf.where(cond_2, t_min_2, t_min)
-        t_min = tf.where(cond_3, t_min_3, t_min)
-        t_min = tf.where(cond_4, t_min_4, t_min)
+        valid = (wedges_indices >= 0) & (t_min >= 0.0) & (t_min <= lengths)
+        valid &= (h_sum > 0.0) | axial_valid
+        wedges_indices = tf.where(valid, wedges_indices, -1)
+        inter_point = origins + t_min[..., None] * e_hat
 
-        # Mask paths for which the interaction point is not on the finite
-        # wedge
-        # [num_targets, num_sources, max_num_paths]
-        mask_ = tf.logical_and(
-            tf.greater_equal(t_min, tf.zeros_like(t_min)),
-            tf.less_equal(t_min, wedges_length))
-        # [num_targets, num_sources, max_num_paths]
-        wedges_indices = tf.where(mask_, wedges_indices, -1)
-
-        # Interaction points
-        # Expand to broadcast with coordinates
-        # [num_targets, num_sources, max_num_paths, 1]
-        t_min = tf.expand_dims(t_min, axis=3)
-        # [num_targets, num_sources, max_num_paths, 3]
-        inter_point = origins + t_min*e_hat
-
-        # Discard wedges with no valid paths
-        # [max_num_paths]
-        used_wedges = tf.where(tf.reduce_any(tf.not_equal(wedges_indices, -1),
-                                             axis=(0,1)))[:,0]
-        # [num_targets, num_sources, max_num_paths, 3]
-        inter_point = tf.gather(inter_point, used_wedges, axis=2)
-        # [num_targets, num_sources, max_num_paths]
+        used_wedges = tf.where(tf.reduce_any(wedges_indices >= 0, axis=(0, 1)))[:, 0]
         wedges_indices = tf.gather(wedges_indices, used_wedges, axis=2)
+        inter_point = tf.gather(inter_point, used_wedges, axis=2)
 
-        # Back to the required precision
-        inter_point = tf.cast(inter_point, self._rdtype)
+        return wedges_indices, tf.cast(inter_point, self._rdtype)
 
-        return wedges_indices, inter_point
-    
     def _check_wedges_visibility(self, targets, sources, wedges_indices,
                                  vertices, case):
         r"""

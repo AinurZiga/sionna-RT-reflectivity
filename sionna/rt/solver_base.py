@@ -808,7 +808,9 @@ class SolverBase:
                           selected_wedges_start)
         # Set arbitrarely the vector for the edges
         # [num_selected_edges, 3]
-        e_hat = tf.where(tf.expand_dims(is_edge, axis=1), e_hat_ind, e_hat)
+        # Use the actual mesh edge; normals determine only its orientation.
+        oriented_e_hat = tf.where(origin_indicator < 0, -e_hat_ind, e_hat_ind)
+        e_hat = tf.where(is_edge[:, None], e_hat_ind, oriented_e_hat)
 
         _n1 = tf.gather(self._normals, wedges_2_prim[:,0])
         _n2 = tf.gather(self._normals, wedges_2_prim[:,1])

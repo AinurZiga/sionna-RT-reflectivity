@@ -1152,6 +1152,10 @@ class Paths:
             new_paths.phi_r = tf.gather(self.phi_r, indices, axis=axis-1)
             new_paths.tau = tf.gather(self.tau, indices, axis=axis-1)
 
+        vertex_wedge_mask = getattr(self, "vertex_wedge_mask", None)
+        if vertex_wedge_mask is not None:
+            new_paths.vertex_wedge_mask = tf.gather(vertex_wedge_mask, indices, axis=axis - 1)
+
         return new_paths
 
 
@@ -1357,6 +1361,10 @@ def invert_s_t(paths: Paths, paths_tmp: PathsTmpData):
     new_paths.objects = tf.transpose(paths.objects[::-1], perm=[0, 2, 1, 3])
     new_paths.true_objects = tf.transpose(paths.true_objects[::-1], perm=[0, 2, 1, 3])
     new_paths.my_types = tf.transpose(paths.my_types[::-1], perm=[0, 2, 1, 3])
+
+    vertex_wedge_mask = getattr(paths, "vertex_wedge_mask", None)
+    if vertex_wedge_mask is not None:
+        new_paths.vertex_wedge_mask = tf.transpose(vertex_wedge_mask, perm=[1, 0, 2, 3])
 
     new_paths.theta_t = tf.transpose(paths.theta_r, perm=[1, 0, 2])
     new_paths.phi_t = tf.transpose(paths.phi_r, perm=[1, 0, 2])

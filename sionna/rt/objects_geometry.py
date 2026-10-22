@@ -27,16 +27,16 @@ K_MAX = 100
 
 
 class ObjectsGeometry:
-    def __init__(self, solver_paths: SolverPaths, is_table_gfi=True):
+    def __init__(self, solver_paths: SolverPaths, is_table_gfi=True, gfi_filename=None):
         self.solver_paths = solver_paths
-        self._dtype = self.solver_paths._dtype   # complex
-        self._rdtype = self.solver_paths._rdtype  # float
+        self._dtype = self.solver_paths._dtype
+        self._rdtype = self.solver_paths._rdtype
         self.is_table_gfi = is_table_gfi
 
-        if self.is_table_gfi:
-            self.diffraction_tables = DiffractionTables(dtype=self._dtype)
-        else:
-            self.diffraction_tables = None
+        # Keep the container even when GFI lookup is disabled: EV uses its file paths.
+        self.diffraction_tables = DiffractionTables(
+            dtype=self._dtype, use_gfi_lookup=is_table_gfi, gfi_filename=gfi_filename
+        )
 
         self.is_vertex_diffraction = True
         self.is_double_diffraction = False
@@ -45,13 +45,15 @@ class ObjectsGeometry:
         self.is_sbr_rxs = True
 
         self.is_glass_transmission = False
-        self.los_transmissions = 'one'  # 'one, 'two'
+        self.los_transmissions = "one"
 
         self._vertex_indices = tf.zeros([0], dtype=tf.int32)
         self._update_geometry()
 
         shapes = self.solver_paths._mi_scene.shapes()
-        self._objects_2_primitives = np.cumsum([0] + [shape.effective_primitive_count() for shape in shapes])
+        self._objects_2_primitives = np.cumsum(
+            [0] + [shape.effective_primitive_count() for shape in shapes]
+        )
 
     def _update_geometry(self):
         """Refresh geometry from the solver without rebuilding connectivity."""

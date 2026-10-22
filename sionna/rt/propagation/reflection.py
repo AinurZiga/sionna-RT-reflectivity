@@ -421,7 +421,7 @@ class Reflection:
         # We use the Moeller Trumbore algorithm
         # t : [num_targets, num_sources, num_samples]
         # hit : [num_targets, num_sources, num_samples]
-        t, hit = moller_trumbore(current, d, p0, p1, p2, self.solver.EPSILON)
+        t, hit = moller_trumbore(current, d, p0, p1, p2, self.solver.EPSILON, barycentric_epsilon=0.0)
         # [num_targets, num_sources, num_samples]
         valid = tf.logical_and(valid, tf.logical_or(~active, hit))
 
@@ -1162,7 +1162,7 @@ class Reflection:
         # We use the Moeller Trumbore algorithm
         # t : [num_targets, num_sources, num_samples]
         # hit : [num_targets, num_sources, num_samples]
-        t, hit = moller_trumbore(current, d, p0, p1, p2, self.solver.EPSILON)
+        t, hit = moller_trumbore(current, d, p0, p1, p2, self.solver.EPSILON, barycentric_epsilon=0.0)
         # [num_targets, num_sources, num_samples]
         valid = tf.logical_and(valid, tf.logical_or(~active, hit))
 

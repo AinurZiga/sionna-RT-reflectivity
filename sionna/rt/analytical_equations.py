@@ -61,6 +61,71 @@ def cylinder_tm_inc_scat_total(theta_arr, cylinder_radius, circle_radius, k, ter
     E_tot = E_inc + E_scat
     return E_inc, E_scat, E_tot
 
+def sphere_tm_fast(phi_arr, theta_arr, sphere_radius, circle_radius, k):
+    phi_arr = np.asarray(phi_arr)
+    theta_arr = np.asarray(theta_arr)
+
+    beta_a = k * sphere_radius
+    beta_r = k * circle_radius
+    num_terms = 100
+
+    sin_theta = np.sin(theta_arr)
+    cos_theta = np.cos(theta_arr)
+    sin_phi = np.sin(phi_arr)
+    cos_phi = np.cos(phi_arr)
+
+    phase = np.exp(-1j * beta_r * cos_theta)
+    E_r_i = sin_theta * cos_phi * phase
+    E_theta_i = cos_theta * cos_phi * phase
+    E_phi_i = -sin_phi * phase
+
+    n = np.arange(1, num_terms + 1)
+    a_n = 1j**(-n) * (2*n + 1) / (n*(n + 1))
+
+    b_n = -a_n * np.array([
+        _get_spherical_bessel_derivative1(i, beta_a) /
+        _get_spherical_hankel2_derivative1(i, beta_a) for i in n
+    ])
+    c_n = -a_n * np.array([
+        _get_spherical_bessel(i, beta_a) /
+        _get_spherical_hankel2(i, beta_a) for i in n
+    ])
+
+    h = np.array([_get_spherical_hankel2(i, beta_r) for i in n])
+    h_d1 = np.array([_get_spherical_hankel2_derivative1(i, beta_r) for i in n])
+    h_d2 = np.array([_get_spherical_hankel2_derivative2(i, beta_r) for i in n])
+
+    P = assoc_legendre_p_all(num_terms, 1, cos_theta, diff_n=1)
+
+    legendre = P[0, 1:num_terms+1, 1]
+    legendre_derivative = P[1, 1:num_terms+1, 1]
+
+    # Shape: (num_terms, num_angles)
+    b = b_n[:, None]
+    c = c_n[:, None]
+    h = h[:, None]
+    h_d1 = h_d1[:, None]
+    h_d2 = h_d2[:, None]
+
+    e_r_s_coef = np.sum(b * (h_d2 + h) * legendre, axis=0)
+    e_theta_s_coef = np.sum(
+        1j * b * h_d1 * sin_theta * legendre_derivative
+        - c * h * legendre / sin_theta, axis=0
+    )
+    e_phi_s_coef = np.sum(
+        1j * b * h_d1 * legendre / sin_theta
+        - c * h * sin_theta * legendre_derivative, axis=0
+    )
+
+    E_r_s = -1j * cos_phi * e_r_s_coef
+    E_theta_s = cos_phi / beta_r * e_theta_s_coef
+    E_phi_s = sin_phi / beta_r * e_phi_s_coef
+
+    E_s = np.array([E_r_s, E_theta_s, E_phi_s])
+    E_t = np.array([E_r_i + E_r_s, E_theta_i + E_theta_s, E_phi_i + E_phi_s])
+
+    return np.linalg.norm(E_t, axis=0), np.linalg.norm(E_s, axis=0)
+
 def sphere_tm(phi_arr, theta_arr, sphere_radius, circle_radius, k):
     # angles in radians
     theta_arr = np.array(theta_arr)
@@ -81,7 +146,7 @@ def sphere_tm(phi_arr, theta_arr, sphere_radius, circle_radius, k):
         theta = theta_arr[i]
         
         # Pmn_z, Pmn_d_z = lpmn(1, num_terms, np.cos(theta))  # both [2, num_terms + 1]
-        Pmn_z, Pmn_d_z = assoc_legendre_p_all(num_terms, 1, np.cos(theta))  # both [2, num_terms + 1]
+        Pmn_z, Pmn_d_z = assoc_legendre_p_all(num_terms, 1, np.cos(theta), diff_n=1)  # both [2, num_terms + 1]
 
         e_r_s_coef = 0.0 + 0.0j 
         e_theta_s_coef = 0.0 + 0.0j 
@@ -89,8 +154,10 @@ def sphere_tm(phi_arr, theta_arr, sphere_radius, circle_radius, k):
         
         for n in range(1, num_terms + 1):
             a_n = 1j**(-n) * (2*n + 1) / (n*(n + 1))
-            legandre = Pmn_z[1, n]     
-            legandre_derivative = Pmn_d_z[1, n]
+            # legandre = Pmn_z[1, n]     
+            # legandre_derivative = Pmn_d_z[1, n]
+            legandre = Pmn_z[n, 1]     
+            legandre_derivative = Pmn_d_z[n, 1]
 
             b_n = -a_n * _get_spherical_bessel_derivative1(n, beta_a) / _get_spherical_hankel2_derivative1(n, beta_a)
             c_n = -a_n * _get_spherical_bessel(n, beta_a) / _get_spherical_hankel2(n, beta_a)

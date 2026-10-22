@@ -23,7 +23,7 @@ from .utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
             cot, cross, sign, rotation_matrix, acos_diff
 from .solver_base import SolverBase
 from .scattering_pattern import ScatteringPattern
-from .diffraction_funcs import calc_angles, calc_angles_concave, transition_func
+from .diffraction_funcs import calc_angles, calc_angles_concave, transition_func, cot_transition_stable
 
 
 class SolverPaths(SolverBase):
@@ -338,6 +338,13 @@ class SolverPaths(SolverBase):
             los_prim_t = los_prim
             candidates_t = candidates
             _candidates = candidates
+
+        elif method == 'env_driven':
+            obj_primitive_idxs = self.obj_geom.primitive_idxs
+            visible = self._my_list_candidates_env_depth_1(sources, obj_primitive_idxs) # [num_tx, num_obj_primitives]
+            los_prim = tf.boolean_mask(obj_primitive_idxs, tf.reduce_any(visible, axis=0))
+            candidates = los_prim[None, :]  # [1, num_candidates
+            candidates = tf.concat([tf.constant([[-1]], dtype=candidates.dtype), candidates], axis=1)
             
         elif method == 'fibonacci':
             # Sample sequences of primitives using shoot-and-bounce
@@ -438,6 +445,21 @@ class SolverPaths(SolverBase):
         objects_mask = diff_paths.objects == -1
         valid_wedge_idxs = tf.where(objects_mask, 0, diff_paths.objects)
         diff_paths.true_objects = tf.gather(self._wedges_objects[:, 0], valid_wedge_idxs, axis=0)
+
+        ############################################
+        # Vertex diffracted paths
+        ############################################
+        vertex_diff_paths = Paths(sources=sources, targets=targets, scene=self._scene,
+                            types=Paths.VERTEX_DIFFRACTED)
+        vertex_diff_paths_tmp = PathsTmpData(sources, targets, self._dtype)
+
+        if vertex_diffraction:
+            vertex_diff_paths, vertex_diff_paths_tmp = self.vertex_diffraction.tracing(sources, targets)
+
+            vertex_diff_paths.my_types = Paths.VERTEX_DIFFRACTED * tf.ones_like(vertex_diff_paths.objects, tf.int32)
+
+            valid_vertex_idxs = tf.where(vertex_diff_paths.objects == -1, 0, vertex_diff_paths.objects)
+            vertex_diff_paths.true_objects = tf.gather(self.vertex_diffraction.vertices_2_objects_sionna, valid_vertex_idxs)
             
         ############################################
         # Reflected + Diffracted paths
@@ -731,6 +753,7 @@ class SolverPaths(SolverBase):
                     dd_paths_wv.mask = tf.transpose(active, perm=[1, 0, 2])
 
                     dd_paths_wv = self.double_diffraction._gather_valid_paths(dd_paths_wv)
+                    dd_paths_wv.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_wv, vertex_depth=1)
                     dd_paths_wv.dd_type = 1 * tf.ones(dd_paths_wv.mask.shape, dtype=tf.int32)  # 1: wedge-vertex
                     dd_paths_wv.my_types = tf.stack([Paths.DIFFRACTED * tf.ones_like(dd_paths_wv.mask, tf.int32), 
                                                      Paths.VERTEX_DIFFRACTED * tf.ones_like(dd_paths_wv.mask, tf.int32)], 
@@ -786,8 +809,9 @@ class SolverPaths(SolverBase):
                     dd_paths_vw.mask = tf.transpose(active, perm=[1, 0, 2])
 
                     dd_paths_vw = self.double_diffraction._gather_valid_paths(dd_paths_vw)
+                    dd_paths_vw.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_vw, vertex_depth=0)
+                    
                     dd_paths_vw.dd_type = 2 * tf.ones(dd_paths_vw.mask.shape, dtype=tf.int32)  # 2: vertex-wedge
-
                     dd_paths_vw.my_types = tf.stack([Paths.VERTEX_DIFFRACTED * tf.ones_like(dd_paths_vw.mask, tf.int32), 
                                                      Paths.DIFFRACTED * tf.ones_like(dd_paths_vw.mask, tf.int32)], 
                                                      axis=0)
@@ -849,21 +873,6 @@ class SolverPaths(SolverBase):
                     
                     dd_paths = merge_paths([dd_paths, dd_paths_vv]) 
                     dd_paths_tmp = merge_paths_tmp([dd_paths_tmp, dd_paths_vv_tmp])
-
-        ############################################
-        # Vertex diffracted paths
-        ############################################
-        vertex_diff_paths = Paths(sources=sources, targets=targets, scene=self._scene,
-                           types=Paths.VERTEX_DIFFRACTED)
-        vertex_diff_paths_tmp = PathsTmpData(sources, targets, self._dtype)
-
-        if vertex_diffraction:
-            vertex_diff_paths, vertex_diff_paths_tmp = self.vertex_diffraction.tracing(sources, targets)
-
-            vertex_diff_paths.my_types = Paths.VERTEX_DIFFRACTED * tf.ones_like(vertex_diff_paths.objects, tf.int32)
-
-            valid_vertex_idxs = tf.where(vertex_diff_paths.objects == -1, 0, vertex_diff_paths.objects)
-            vertex_diff_paths.true_objects = tf.gather(self.vertex_diffraction.vertices_2_objects_sionna, valid_vertex_idxs)
 
 
         ############################################
@@ -1136,6 +1145,31 @@ class SolverPaths(SolverBase):
                 diff_paths_tmp.mat_t = diff_mat_t
 
         ############################################
+        # Vertex-diffracted paths
+        ############################################
+        #    
+        if vertex_diff_paths.objects.shape[3] > 0:
+            vertex_diff_mat_t =\
+                self.vertex_diffraction.compute_fields2(etas,
+                            scattering_coefficient, vertex_diff_paths, vertex_diff_paths_tmp)
+            
+            vertex_diff_paths.doppler = self._compute_doppler_shifts(vertex_diff_paths,
+                                                                vertex_diff_paths_tmp,
+                                                                velocity)
+            
+            all_paths = all_paths.merge(vertex_diff_paths)
+            # Only the transition matrix and vector of incidence/reflection are
+            # required for the computation of the paths coefficients
+            all_paths_tmp.mat_t = tf.concat([all_paths_tmp.mat_t, vertex_diff_mat_t],
+                                            axis=-3)
+            all_paths_tmp.k_tx = tf.concat([all_paths_tmp.k_tx,
+                                            vertex_diff_paths_tmp.k_tx],
+                                            axis=-2)
+            all_paths_tmp.k_rx = tf.concat([all_paths_tmp.k_rx,
+                                            vertex_diff_paths_tmp.k_rx],
+                                            axis=-2)
+
+        ############################################
         # Reflection-Diffraction
         ############################################
         if mixed_paths.objects.shape[3] > 0:
@@ -1177,30 +1211,7 @@ class SolverPaths(SolverBase):
                                             vd_refl_paths_tmp.k_rx],
                                            axis=-2)
 
-        ############################################
-        # Vertex-diffracted paths
-        ############################################
-        #    
-        if vertex_diff_paths.objects.shape[3] > 0:
-            vertex_diff_mat_t =\
-                self.vertex_diffraction.compute_fields(etas,
-                            scattering_coefficient, vertex_diff_paths, vertex_diff_paths_tmp)
-            
-            vertex_diff_paths.doppler = self._compute_doppler_shifts(vertex_diff_paths,
-                                                              vertex_diff_paths_tmp,
-                                                              velocity)
-            
-            all_paths = all_paths.merge(vertex_diff_paths)
-            # Only the transition matrix and vector of incidence/reflection are
-            # required for the computation of the paths coefficients
-            all_paths_tmp.mat_t = tf.concat([all_paths_tmp.mat_t, vertex_diff_mat_t],
-                                            axis=-3)
-            all_paths_tmp.k_tx = tf.concat([all_paths_tmp.k_tx,
-                                            vertex_diff_paths_tmp.k_tx],
-                                           axis=-2)
-            all_paths_tmp.k_rx = tf.concat([all_paths_tmp.k_rx,
-                                            vertex_diff_paths_tmp.k_rx],
-                                           axis=-2)
+        
             
         
         ############################################
@@ -1545,6 +1556,23 @@ class SolverPaths(SolverBase):
             los_candidates = None
 
         return all_candidates, los_candidates
+
+    def _my_list_candidates_env_depth_1(self, devices, primitive_idxs=None):
+        if primitive_idxs is None:
+            primitive_idxs = tf.range(tf.shape(self._primitives)[0], dtype=tf.int32)
+
+        triangles = tf.gather(self._primitives, primitive_idxs)
+        centers = tf.reduce_mean(triangles, axis=1)
+        rays = centers[None, :, :] - devices[:, None, :]
+        directions, distances = tf.linalg.normalize(rays, axis=-1)
+        origins = tf.broadcast_to(devices[:, None, :], tf.shape(rays))
+
+        blocked = self._test_obstruction(
+            tf.reshape(origins, [-1, 3]),
+            tf.reshape(directions, [-1, 3]),
+            tf.reshape(distances, [-1]),
+        )
+        return tf.reshape(~blocked, tf.shape(rays)[:2])
     
     def _my_list_candidates_depth_1(self, sources, primitive_idxs=None):
         # self.obj
@@ -2105,50 +2133,27 @@ class SolverPaths(SolverBase):
         # [num_targets, num_sources, max_num_paths, 2, 1]
         r_n = -tf.matmul(w_r_n, r_n)
 
-        # Compute D_1, D_2, D_3, D_4
-        # [num_targets, num_sources, max_num_paths]
+        # Compute the cotangent-transition products jointly near shadow boundaries.
         phi_m = phi - phi_prime
         phi_p = phi + phi_prime
 
-        # [num_targets, num_sources, max_num_paths]
-        cot_1 = cot((PI + phi_m)/(2*n))
-        cot_2 = cot((PI - phi_m)/(2*n))
-        cot_3 = cot((PI + phi_p)/(2*n))
-        cot_4 = cot((PI - phi_p)/(2*n))
+        d_mul = -tf.cast(tf.exp(-1j * PI / 4.0), self._dtype) / tf.cast(
+            2.0 * n * tf.sqrt(2.0 * PI * k) * tf.sin(beta_prime), self._dtype
+        )
 
-        def n_p(beta, n):
-            return tf.math.round((beta + PI)/(2.*n*PI))
+        ell = s_prime * s / (s_prime + s) * tf.square(tf.sin(beta_prime))
+        k_ell = k * ell
 
-        def n_m(beta, n):
-            return tf.math.round((beta - PI)/(2.*n*PI))
-
-        def a_p(beta, n):
-            return 2*tf.cos((2.*n*PI*n_p(beta, n)-beta)/2.)**2
-
-        def a_m(beta, n):
-            return 2*tf.cos((2.*n*PI*n_m(beta, n)-beta)/2.)**2
-
-        d_mul = - tf.cast(tf.exp(-1j*PI/4.), self._dtype) / tf.cast((2*n)*tf.sqrt(2*PI*k)*tf.math.sin(beta_prime), self._dtype)
-
-        # [num_targets, num_sources, max_num_paths]
-        ell = s_prime*s/(s_prime + s) * tf.math.sin(beta_prime)**2
-
-        # [num_targets, num_sources, max_num_paths]
-        cot_1 = tf.complex(cot_1, tf.zeros_like(cot_1))
-        cot_2 = tf.complex(cot_2, tf.zeros_like(cot_2))
-        cot_3 = tf.complex(cot_3, tf.zeros_like(cot_3))
-        cot_4 = tf.complex(cot_4, tf.zeros_like(cot_4))
-        
-        d_1 = d_mul*cot_1 * transition_func(k*ell*a_p(phi_m, n))
-        d_2 = d_mul*cot_2 * transition_func(k*ell*a_m(phi_m, n))
-        d_3 = d_mul*cot_3 * transition_func(k*ell*a_p(phi_p, n))
-        d_4 = d_mul*cot_4 * transition_func(k*ell*a_m(phi_p, n))
+        d_1 = d_mul * tf.cast(cot_transition_stable(phi_m, n, k_ell, plus=True), self._dtype)
+        d_2 = d_mul * tf.cast(cot_transition_stable(phi_m, n, k_ell, plus=False), self._dtype)
+        d_3 = d_mul * tf.cast(cot_transition_stable(phi_p, n, k_ell, plus=True), self._dtype)
+        d_4 = d_mul * tf.cast(cot_transition_stable(phi_p, n, k_ell, plus=False), self._dtype)
 
         # [num_targets, num_sources, max_num_paths, 1, 1]
-        d_1 = tf.reshape(d_1, tf.concat([tf.shape(d_1), [1,1]], axis=0))
-        d_2 = tf.reshape(d_2, tf.concat([tf.shape(d_2), [1,1]], axis=0))
-        d_3 = tf.reshape(d_3, tf.concat([tf.shape(d_3), [1,1]], axis=0))
-        d_4 = tf.reshape(d_4, tf.concat([tf.shape(d_4), [1,1]], axis=0))
+        d_1 = tf.reshape(d_1, tf.concat([tf.shape(d_1), [1, 1]], axis=0))
+        d_2 = tf.reshape(d_2, tf.concat([tf.shape(d_2), [1, 1]], axis=0))
+        d_3 = tf.reshape(d_3, tf.concat([tf.shape(d_3), [1, 1]], axis=0))
+        d_4 = tf.reshape(d_4, tf.concat([tf.shape(d_4), [1, 1]], axis=0))
 
         # [num_targets, num_sources, max_num_paths]
         spreading_factor = tf.sqrt(s_prime / (s*(s_prime + s)))
@@ -4223,36 +4228,34 @@ class SolverPaths(SolverBase):
     
 
 def merge_paths(paths, is_dd=True):
-    # both empty
-    if paths[0].objects.shape[3] == 0 and paths[1].objects.shape[3] == 0:
+    nonempty = [p for p in paths if p.objects.shape[3] != 0]
+    if not nonempty:
         return paths[0]
 
-    all_paths = paths[0]
-    for i, path in enumerate(paths):
-        if path.objects.shape[3] != 0:
-            all_paths = path  # non-empty path
-            idx = i
-            break
+    all_paths = nonempty[0]
+    for path in nonempty[1:]:
+        mask_a = getattr(all_paths, "vertex_wedge_mask", None)
+        mask_b = getattr(path, "vertex_wedge_mask", None)
 
-    for i, path in enumerate(paths):
-        if i == idx:
-            continue
+        if mask_a is not None or mask_b is not None:
+            num_slots = tf.shape(mask_a if mask_a is not None else mask_b)[-1]
 
-        if path.objects.shape[3] == 0:
-            continue
+            if mask_a is None:
+                mask_a = tf.zeros(tf.concat([tf.shape(all_paths.mask), [num_slots]], axis=0), tf.bool)
+            if mask_b is None:
+                mask_b = tf.zeros(tf.concat([tf.shape(path.mask), [num_slots]], axis=0), tf.bool)
 
-        all_paths.objects = tf.concat([all_paths.objects, path.objects], axis=3)
-        all_paths.true_objects = tf.concat([all_paths.true_objects, path.true_objects], axis=3)
-        all_paths.my_types = tf.concat([all_paths.my_types, path.my_types], axis=3)
-        all_paths.vertices = tf.concat([all_paths.vertices, path.vertices], axis=3)
-        all_paths.mask = tf.concat([all_paths.mask, path.mask], axis=2)
-        all_paths.targets_sources_mask = tf.concat([all_paths.targets_sources_mask, path.targets_sources_mask], axis=2)
-        all_paths.types = all_paths.types
-        all_paths.theta_t = tf.concat([all_paths.theta_t, path.theta_t], axis=2)
-        all_paths.phi_t = tf.concat([all_paths.phi_t, path.phi_t], axis=2)
-        all_paths.theta_r = tf.concat([all_paths.theta_r, path.theta_r], axis=2)
-        all_paths.phi_r = tf.concat([all_paths.phi_r, path.phi_r], axis=2)
-        all_paths.tau = tf.concat([all_paths.tau, path.tau], axis=2)
+            tf.debugging.assert_equal(tf.shape(mask_a)[-1], tf.shape(mask_b)[-1],
+                                      message="Vertex wedge masks have different slot counts.")
+            all_paths.vertex_wedge_mask = tf.concat([mask_a, mask_b], axis=2)
+
+        for name in ("objects", "true_objects", "my_types", "vertices"):
+            value = tf.concat([getattr(all_paths, name), getattr(path, name)], axis=3)
+            setattr(all_paths, name, value)
+
+        for name in ("mask", "targets_sources_mask", "theta_t", "phi_t", "theta_r", "phi_r", "tau"):
+            value = tf.concat([getattr(all_paths, name), getattr(path, name)], axis=2)
+            setattr(all_paths, name, value)
 
         if is_dd:
             all_paths.dd_type = tf.concat([all_paths.dd_type, path.dd_type], axis=2)
