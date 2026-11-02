@@ -14,7 +14,7 @@ from ..utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
         compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
             cot, cross, sign, rotation_matrix, acos_diff
 from sionna.rt.diffraction_funcs import calc_angles, calc_angles_concave, my_wd_compute_fields, transition_func,\
-    my_wd_compute_fields2
+        my_wd_compute_fields2, cot_transition_stable
 
 if TYPE_CHECKING:
     from ..solver_base import SolverBase
@@ -46,16 +46,20 @@ class WedgeDiffraction:
         diff_wedges_indices = self.solver._wedges_from_primitives(los_prim,
                                                         edge_diffraction)
 
-        # Discard concave wedges if needed
         
+        ### 1)
         # Discard paths for which at least one of the transmitter or
         # receiver is inside the wedge.
         # diff_wedges_indices : [num_targets, num_sources, max_num_paths]
-        #   Indices of the intersected wedges
-        if not(case is None or case == 'None'):
-            diff_wedges_indices = self._discard_obstructing_wedges_and_corners(
-                                                diff_wedges_indices, targets,
-                                                sources, case)
+        # if not(case is None or case == 'None'):
+        #     diff_wedges_indices = self._discard_obstructing_wedges_and_corners(
+        #                                         diff_wedges_indices, targets,
+        #                                         sources, case)
+
+        ### 2)
+        # Expand candidates to [num_targets, num_sources, num_candidate_wedges].
+        candidate_shape = tf.stack([tf.shape(targets)[0], tf.shape(sources)[0], tf.size(diff_wedges_indices)])
+        diff_wedges_indices = tf.broadcast_to(diff_wedges_indices[None, None, :], candidate_shape)
 
         # Compute the intersection points with the wedges, and discard paths
         # for which the intersection point is not on the finite wedge.
@@ -508,6 +512,283 @@ class WedgeDiffraction:
         paths.path_types = tf.fill(paths.objects.shape, Paths.DIFFRACTED)
 
         return paths
+
+
+    def compute_fields(self, relative_permittivity, scattering_coefficient, paths, paths_tmp):
+        r"""
+        Compute ordinary wedge-diffraction matrices for valid paths only.
+
+        Parameters
+        ----------
+        relative_permittivity : tf.Tensor, complex, shape [num_objects]
+            Relative permittivity indexed by scene object.
+        scattering_coefficient : tf.Tensor, real, shape [num_objects]
+            Scattering coefficients indexed by scene object.
+        paths : Paths
+            Traced wedge paths with mask [targets, sources, paths].
+        paths_tmp : PathsTmpData
+            Retained for compatibility with the field computation interface.
+
+        Returns
+        -------
+        tf.Tensor, complex, shape [targets, sources, paths, 2, 2]
+            Transition matrices in the global spherical polarization bases.
+            Invalid paths have zero matrices.
+        """
+
+        shape = tf.shape(paths.mask)
+        output_shape = tf.concat([shape, [2, 2]], axis=0)
+        indices = tf.cast(tf.where(paths.mask & (paths.objects[0] >= 0)), tf.int32)
+
+        def compute_valid():
+            # Each selected path produces exactly one matrix.
+            wedge_idxs = tf.gather_nd(paths.objects[0], indices)
+            points = tf.gather_nd(paths.vertices[0], indices)
+            sources = tf.gather(paths.sources, indices[:, 1])
+            targets = tf.gather(paths.targets, indices[:, 0])
+
+            theta_t = tf.gather_nd(paths.theta_t, indices)
+            phi_t = tf.gather_nd(paths.phi_t, indices)
+            theta_r = tf.gather_nd(paths.theta_r, indices)
+            phi_r = tf.gather_nd(paths.phi_r, indices)
+
+            normals, e_hat, n = self._wedge_geometry(wedge_idxs)
+            etas, scattering = self._wedge_materials(
+                relative_permittivity, scattering_coefficient, wedge_idxs, points
+            )
+
+            s_prime_hat, s_prime = normalize(points - sources)
+            s_hat, s = normalize(targets - points)
+
+            matrices = self._wedge_field_matrices(
+                wedge_idxs, normals, e_hat, n, etas, scattering,
+                s_prime_hat, s_hat, s_prime, s,
+                theta_t, phi_t, theta_r, phi_r
+            )
+
+            # Incident spherical spreading is applied once, as in SolverPaths.
+            matrices /= tf.cast(s_prime[:, None, None], self._dtype)
+            return tf.scatter_nd(indices, matrices, output_shape)
+
+        return tf.cond(
+            tf.shape(indices)[0] > 0,
+            compute_valid,
+            lambda: tf.zeros(output_shape, dtype=self._dtype)
+        )
+
+
+    def _wedge_geometry(self, wedge_idxs):
+        r"""
+        Gather geometry without reversing wedge orientation.
+
+        Parameters
+        ----------
+        wedge_idxs : tf.Tensor, integer, shape [N]
+            Valid global wedge indices.
+
+        Returns
+        -------
+        normals : tf.Tensor, real, shape [N, 2, 3]
+            Normals of the 0- and n-faces.
+        e_hat : tf.Tensor, real, shape [N, 3]
+            Oriented unit edge tangents.
+        n : tf.Tensor, real, shape [N]
+            Wedge parameters, including concave wedges.
+        """
+
+        solver = self.solver
+        normals = tf.gather(solver._wedges_normals, wedge_idxs)
+        e_hat = tf.gather(solver._wedges_e_hat, wedge_idxs)
+
+        wedge_angle = PI - acos_diff(dot(normals[:, 0], normals[:, 1], clip=True))
+        is_concave = tf.gather(solver._is_concave_wedge, wedge_idxs)
+        n = tf.where(is_concave, wedge_angle / PI, (2.0 * PI - wedge_angle) / PI)
+
+        return normals, e_hat, n
+
+
+    def _wedge_materials(self, relative_permittivity, scattering_coefficient, wedge_idxs, points):
+        r"""
+        Obtain the material properties of both faces for each selected path.
+
+        Parameters
+        ----------
+        relative_permittivity : tf.Tensor, complex, shape [num_objects]
+            Relative permittivity indexed by object.
+        scattering_coefficient : tf.Tensor, real, shape [num_objects]
+            Scattering coefficients indexed by object.
+        wedge_idxs : tf.Tensor, integer, shape [N]
+            Valid global wedge indices.
+        points : tf.Tensor, real, shape [N, 3]
+            Diffraction points supplied to the material callable.
+
+        Returns
+        -------
+        etas : tf.Tensor, complex, shape [N, 2]
+            Relative permittivity of both wedge faces.
+        scattering : tf.Tensor, real, shape [N, 2]
+            Scattering coefficients of both wedge faces.
+        """
+
+        object_idxs = tf.gather(self.solver._wedges_objects, wedge_idxs)
+        rm_callable = self._scene.radio_material_callable
+
+        if rm_callable is None:
+            return tf.gather(relative_permittivity, object_idxs), tf.gather(scattering_coefficient, object_idxs)
+
+        material_points = tf.repeat(points[:, None, :], 2, axis=1)
+        etas, scattering, _ = rm_callable(object_idxs, material_points)
+        return etas, scattering
+
+
+    def _wedge_field_matrices(self, wedge_idxs, normals, e_hat, n, etas, scattering,
+                            s_prime_hat, s_hat, s_prime, s,
+                            theta_t, phi_t, theta_r, phi_r):
+        r"""
+        Compute flat ordinary-WD matrices using the existing field convention.
+
+        Parameters
+        ----------
+        wedge_idxs : tf.Tensor, integer, shape [N]
+            Valid wedge indices.
+        normals : tf.Tensor, real, shape [N, 2, 3]
+            Face normals.
+        e_hat : tf.Tensor, real, shape [N, 3]
+            Oriented edge tangents.
+        n : tf.Tensor, real, shape [N]
+            Wedge parameters.
+        etas, scattering : tf.Tensor, shape [N, 2]
+            Complex permittivities and real scattering coefficients.
+        s_prime_hat, s_hat : tf.Tensor, real, shape [N, 3]
+            Incident and outgoing propagation directions.
+        s_prime, s : tf.Tensor, real, shape [N]
+            Source-to-edge and edge-to-target distances.
+        theta_t, phi_t, theta_r, phi_r : tf.Tensor, real, shape [N]
+            Global departure and arrival polarization-basis angles.
+
+        Returns
+        -------
+        tf.Tensor, complex, shape [N, 2, 2]
+            Matrices including outgoing spreading and optional glass transmission.
+            The caller must apply the incident factor 1/s_prime.
+        """
+
+        # wavelength = self._scene.wavelength
+        # k = 2.0 * PI / wavelength
+        # n_0_hat, n_n_hat = normals[:, 0], normals[:, 1]
+
+        # phi_prime_hat, _ = normalize(cross(s_prime_hat, e_hat))
+        # beta_0_prime_hat = cross(phi_prime_hat, s_prime_hat)
+        # phi_hat_, _ = normalize(-cross(s_hat, e_hat))
+        # beta_0_hat = cross(phi_hat_, s_hat)
+
+        # phi_prime, phi, beta_prime, _ = calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat)
+        # phi_prime_c, phi_c, _, _ = calc_angles_concave(n_0_hat, e_hat, s_prime_hat, s_hat, n)
+        # phi_prime = tf.where(n < 1.0, phi_prime_c, phi_prime)
+        # phi = tf.where(n < 1.0, phi_c, phi)
+
+        wavelength = self._scene.wavelength
+        k = 2.0 * PI / wavelength
+        n_0_hat, n_n_hat = normals[:, 0], normals[:, 1]
+
+        # Locate the source in the original oriented cross-sectional plane.
+        t_0_hat = cross(n_0_hat, e_hat)
+        source_phi = tf.math.floormod(
+            tf.atan2(-dot(s_prime_hat, n_0_hat), -dot(s_prime_hat, t_0_hat)),
+            2.0 * PI,
+        )
+        use_other_sector = source_phi > n * PI
+
+        # Select the complementary sector while preserving physical face identities.
+        n_0_hat = tf.where(use_other_sector[:, None], -n_0_hat, n_0_hat)
+        n_n_hat = tf.where(use_other_sector[:, None], -n_n_hat, n_n_hat)
+        e_hat = tf.where(use_other_sector[:, None], -e_hat, e_hat)
+        n = tf.where(use_other_sector, 2.0 - n, n)
+
+        # Construct all polarization bases after selecting the sector.
+        phi_prime_hat, _ = normalize(cross(s_prime_hat, e_hat))
+        beta_0_prime_hat = cross(phi_prime_hat, s_prime_hat)
+        phi_hat_, _ = normalize(-cross(s_hat, e_hat))
+        beta_0_hat = cross(phi_hat_, s_hat)
+
+        phi_prime, phi, beta_prime, _ = calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat)
+        phi_prime_c, phi_c, _, _ = calc_angles_concave(n_0_hat, e_hat, s_prime_hat, s_hat, n)
+        phi_prime = tf.where(n < 1.0, phi_prime_c, phi_prime)
+        phi = tf.where(n < 1.0, phi_c, phi)
+
+        def face_matrix(normal, eta, scattering_coef, cos_theta):
+            """Express one face reflection operator in the diffraction bases."""
+            e_i_s, e_i_p, e_r_s, e_r_p = compute_field_unit_vectors(
+                s_prime_hat, s_hat, normal, self.solver.EPSILON
+            )
+            r_s, r_p = reflection_coefficient(eta, cos_theta)
+            reduction = tf.cast(tf.sqrt(1.0 - scattering_coef**2), self._dtype)
+            reflection = tf.stack([r_s * reduction, r_p * reduction], axis=-1)
+
+            mat_in = tf.cast(
+                component_transform(phi_prime_hat, beta_0_prime_hat, e_i_s, e_i_p), self._dtype
+            )
+            mat_out = tf.cast(
+                component_transform(e_r_s, e_r_p, phi_hat_, beta_0_hat), self._dtype
+            )
+            matrix = -tf.matmul(mat_out, reflection[:, :, None] * mat_in)
+            return matrix, e_i_s, e_i_p
+
+        # Use the full 3D incidence angle, consistent with specular reflection.
+        cos_theta_0 = tf.abs(dot(s_prime_hat, n_0_hat, clip=True))
+        cos_theta_n = tf.abs(dot(s_prime_hat, n_n_hat, clip=True))
+
+        r_0, e_i_s_0, e_i_p_0 = face_matrix(
+            n_0_hat, etas[:, 0], scattering[:, 0], cos_theta_0
+        )
+        r_n, _, _ = face_matrix(
+            n_n_hat, etas[:, 1], scattering[:, 1], cos_theta_n
+        )
+
+        phi_m, phi_p = phi - phi_prime, phi + phi_prime
+        d_mul = -tf.cast(tf.exp(-1j * PI / 4.0), self._dtype) / tf.cast(
+            2.0 * n * tf.sqrt(2.0 * PI * k) * tf.sin(beta_prime), self._dtype
+        )
+        ell = s_prime * s / (s_prime + s) * tf.square(tf.sin(beta_prime))
+        k_ell = k * ell
+
+        d1 = d_mul * tf.cast(cot_transition_stable(phi_m, n, k_ell, plus=True), self._dtype)
+        d2 = d_mul * tf.cast(cot_transition_stable(phi_m, n, k_ell, plus=False), self._dtype)
+        d3 = d_mul * tf.cast(cot_transition_stable(phi_p, n, k_ell, plus=True), self._dtype)
+        d4 = d_mul * tf.cast(cot_transition_stable(phi_p, n, k_ell, plus=False), self._dtype)
+
+        eye = tf.eye(2, batch_shape=tf.shape(n), dtype=self._dtype)
+        matrices = (d1 + d2)[:, None, None] * eye
+        matrices += d3[:, None, None] * r_n + d4[:, None, None] * r_0
+
+        # Preserve the original spreading factor and its sign.
+        spreading = tf.sqrt(s_prime / (s * (s_prime + s)))
+        matrices *= -tf.cast(spreading[:, None, None], self._dtype)
+
+        obj_geom = self.solver.obj_geom
+        if obj_geom is not None and obj_geom.is_glass_transmission:
+            glass = obj_geom.diffraction_glass_transmission(
+                valid_wedges_idx=wedge_idxs, n=n, mask=tf.ones_like(n, dtype=tf.bool),
+                phi_prime_hat=phi_prime_hat, beta_0_prime_hat=beta_0_prime_hat,
+                e_i_s_0=e_i_s_0, e_i_p_0=e_i_p_0,
+                s_prime_hat=s_prime_hat, n_0_hat=n_0_hat,
+                wavelength=wavelength, dtype=self._dtype
+            )
+            if obj_geom.los_transmissions == "two":
+                glass = tf.matmul(glass, glass)
+            matrices = tf.matmul(matrices, glass)
+
+        # Preserve the existing NaN handling for the first comparison.
+        matrices = tf.where(tf.math.is_nan(tf.math.real(matrices)), tf.zeros_like(matrices), matrices)
+
+        mat_from_gcs = tf.cast(component_transform(
+            theta_hat(theta_t, phi_t), phi_hat(phi_t), phi_prime_hat, beta_0_prime_hat
+        ), self._dtype)
+        mat_to_gcs = tf.cast(component_transform(
+            phi_hat_, beta_0_hat, theta_hat(theta_r, phi_r), phi_hat(phi_r)
+        ), self._dtype)
+
+        return tf.matmul(mat_to_gcs, tf.matmul(matrices, mat_from_gcs))
 
     def simple_compute_fields(self, wedge_idxs, s_wedge_prime_hat, s_wedge_hat, s_wedge_prime, s_wedge, mask,
                                 ell_ = None, skip_F=False):

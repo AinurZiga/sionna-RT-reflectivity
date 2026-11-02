@@ -183,13 +183,13 @@ class ObjectsGeometry:
                 _vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, _wedge_2_adj_wedges = \
                                     get_data_types(_vertices, facets, facet_2_wedges)  # + facet_2_wedges
 
-            if self.is_double_diffraction:
-                if in_object_filenames is None or in_object_filenames[i] is None:
-                    _dd_wedges = self._get_dd_wedges(facet_2_wedges, _facet_2_adj_facets, _wedge_2_facets)
-                    _dd_wedge_vertex = self._get_dd_edge_vertex(facet_2_wedges, facets, _wedge_2_vertices)
+            # if self.is_double_diffraction:
+            #     if in_object_filenames is None or in_object_filenames[i] is None:
+            #         _dd_wedges = self._get_dd_wedges(facet_2_wedges, _facet_2_adj_facets, _wedge_2_facets)
+            #         _dd_wedge_vertex = self._get_dd_edge_vertex(facet_2_wedges, facets, _wedge_2_vertices)
 
-                dd_wedges = tf.concat([dd_wedges, _dd_wedges], axis=0)
-                dd_wedge_vertex = tf.concat([dd_wedge_vertex, _dd_wedge_vertex], axis=0)
+            #     dd_wedges = tf.concat([dd_wedges, _dd_wedges], axis=0)
+            #     dd_wedge_vertex = tf.concat([dd_wedge_vertex, _dd_wedge_vertex], axis=0)
 
             if not len(_vertices) == num_vertices == len(_vertex_2_wedges):
                 print("Wrong number of vertices in a mesh:", object_names[np.where(np.array(ids) == obj_id)[0][0]])
@@ -208,6 +208,8 @@ class ObjectsGeometry:
 
         # [num_vertices, num_wedges_per_vertex]
         self.vertex_2_wedges = tf.ragged.constant(vertex_2_wedges, dtype=tf.int32)
+        self._remove_duplicate_vertex_wedges(tolerance=1e-6)
+
         # [num_wedges, num_adj_wedges]
         self.wedge_2_adj_wedges = tf.ragged.constant(wedge_2_adj_wedges, dtype=tf.int32)
         # [num_wedges, 2]
@@ -246,6 +248,67 @@ class ObjectsGeometry:
         self.active_primitives_dd = tf.fill([self._primitive_idxs.shape[0]], True)
 
         print('num vertices:', self._vertices.shape[0])
+
+    def _remove_duplicate_vertex_wedges(self, tolerance=1e-6):
+        r"""
+        Remove repeated wedge contributions at coincident vertices.
+
+        Vertex rows and their indices are preserved. Within each group of
+        quantized vertex positions, each wedge ID is retained only once,
+        at its first occurrence. Empty rows are allowed.
+
+        Parameters
+        ----------
+        tolerance : float
+            Positive coordinate quantization step in scene units.
+            Use the same value as in SolverBase._extract_wedges().
+
+        Notes
+        -----
+        This initialization-only operation uses NumPy and does not modify mesh
+        coordinates or the geometry update graph. Quantization groups equal
+        keys; it is not a distance-based merge.
+        """
+
+        if tolerance <= 0:
+            raise ValueError("tolerance must be positive.")
+
+        vertices = self._vertices.numpy()
+        rows = self.vertex_2_wedges.to_list()
+
+        if len(vertices) != len(rows):
+            raise ValueError("Vertex coordinates and vertex_2_wedges must have matching lengths.")
+        if not np.all(np.isfinite(vertices)):
+            raise ValueError("Vertex coordinates contain NaN/Inf.")
+
+        # Quantize in the geometry dtype, matching the edge preprocessing.
+        tol = tf.cast(tolerance, self._vertices.dtype)
+        keys = tf.cast(tf.round(self._vertices / tol), tf.int64).numpy()
+
+        seen = {}
+        cleaned = []
+        removed = 0
+
+        for key, wedges in zip(keys, rows):
+            used = seen.setdefault(tuple(key), set())
+            unique_wedges = []
+
+            for wedge in wedges:
+                if wedge < 0:
+                    continue
+                if wedge in used:
+                    removed += 1
+                    continue
+
+                used.add(wedge)
+                unique_wedges.append(wedge)
+
+            cleaned.append(unique_wedges)
+
+        self.vertex_2_wedges = tf.ragged.constant(
+            cleaned, dtype=self.vertex_2_wedges.dtype, ragged_rank=1
+        )
+        print(f"Removed {removed} duplicate vertex-wedge contributions.")
 
     def set_active_objects_dd(self, object_names):
         self.active_objects_dd = tf.fill([len(self.ids)], False)

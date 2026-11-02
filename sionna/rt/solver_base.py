@@ -53,6 +53,7 @@ class SolverBase:
 
     # Threshold for extracting wedges from the scene [rad]
     WEDGES_ANGLE_THRESHOLD = 1e-5
+    KEEP_FLAT_WEDGES = False
 
     # Small value used to avoid false positive when testing for obstruction
     # Resolution of float32 1e-6:
@@ -574,41 +575,45 @@ class SolverBase:
         all_edges_undirected = tf.reshape(all_edges_undirected,
                                           shape=(3 * v0.shape[0], 2, 3))
         # Edges are oriented such that identical edges have same orientation
-        # [num_edges, 2, 3]
-        all_edges = self._swap_edges(all_edges_undirected)
-        #all_edges = self._my_swap_edges(all_edges_undirected)
 
-        # Remaining point in the triangle for each edge.
-        # This will be used to compute the normals later
-        # [num_prim, 3, 3]
-        remaining_vertex = tf.concat([v2,
-                                      v0,
-                                      v1], axis=1)
-        # [num_edges, 3]
-        remaining_vertex = tf.reshape(remaining_vertex, [-1, 3])
-        remaining_vertex2 = tf.concat([(v0+v1+v2)/3,
-                                      (v0+v1+v2)/3,
-                                      (v0+v1+v2)/3], axis=1)
-        remaining_vertex2 = tf.reshape(remaining_vertex2, [-1, 3])
 
-        # Get unique edges, i.e., wihout duplicates
-        # unique_edges : [num_unique_edges, 2, 3]
-        # indices_of_unique : [num_edges], index of the edge in ``unique_edges``
-        unique_edges, indices_of_unique = tf.raw_ops.UniqueV2(x=all_edges,
-                                                              axis=[0])
+        ### 2) 
+        # Quantize matching keys only; preserve the original geometry.
+        merge_tol = tf.cast(1e-7, self._rdtype)
+        edge_keys = tf.cast(tf.round(all_edges_undirected / merge_tol), tf.int64)
 
-        # indices_of_unique, all_edges_undirected
-        first_occurrence = tf.math.unsorted_segment_min(
-            tf.range(tf.shape(all_edges)[0]),
-            indices_of_unique,
-            tf.reduce_max(indices_of_unique) + 1,
+        # Canonical endpoint order based on integer keys.
+        p0, p1 = edge_keys[:, 0], edge_keys[:, 1]
+        swap = (
+            (p0[:, 0] > p1[:, 0])
+            | ((p0[:, 0] == p1[:, 0]) & (p0[:, 1] > p1[:, 1]))
+            | ((p0[:, 0] == p1[:, 0]) & (p0[:, 1] == p1[:, 1]) & (p0[:, 2] > p1[:, 2]))
         )
-        
+        edge_keys = tf.where(swap[:, None, None], tf.reverse(edge_keys, axis=[1]), edge_keys)
+
+        # Preserve the original per-triangle edge ordering.
+        remaining_vertex = tf.reshape(tf.concat([v2, v0, v1], axis=1), [-1, 3])
+        # remaining_vertex2 = tf.reshape(
+        #     tf.concat([(v0 + v1 + v2) / 3] * 3, axis=1), [-1, 3]
+        # )
+
+        # Group edges by quantized, consistently ordered endpoint keys.
+        unique_keys, indices_of_unique = tf.raw_ops.UniqueV2(x=edge_keys, axis=[0])
+        num_unique_edges = tf.shape(unique_keys)[0]
+
+        # Keep one original edge as the geometric representative of each group.
+        first_occurrence = tf.math.unsorted_segment_min(
+            tf.range(tf.shape(all_edges_undirected)[0], dtype=indices_of_unique.dtype),
+            indices_of_unique,
+            num_unique_edges
+        )
         unique_edges = tf.gather(all_edges_undirected, first_occurrence)
 
-        # Number of occurences of every unique edge
-        # [num_unique_edges]
-        _, _, unique_indices_count = tf.unique_with_counts(indices_of_unique)
+        unique_indices_count = tf.math.unsorted_segment_sum(
+            tf.ones_like(indices_of_unique),
+            indices_of_unique,
+            num_unique_edges
+        )
 
         # Flag indicating which edges shared by exactly one or two primitives,
         # i.e., edges or wedges
@@ -732,7 +737,9 @@ class SolverBase:
         is_selected_ = tf.logical_or(is_selected_, is_selected_different_objects)
         
         # [num_unique_edges]
-        is_selected = tf.logical_and(is_selected, is_selected_)
+        # Optionally retain flat internal edges; keep the adjacency validity check.
+        if not SolverBase.KEEP_FLAT_WEDGES:
+            is_selected = tf.logical_and(is_selected, is_selected_)
 
         #is_selected = tf.fill(dims=is_selected.shape, value=True)  # TODO
 
@@ -823,6 +830,38 @@ class SolverBase:
         is_concave_wedge = tf.logical_and(is_concave_wedge, tf.logical_not(is_edge))
 
         normals = tf.stack([_n1, _n2], axis=1)
+
+        # Parallel, equally oriented face normals: the flat-wedge orientation
+        # cannot be obtained from their cross product.
+        flat_tolerance = tf.cast(1e-6, self._rdtype)
+        normal_cross = cross(normals[:, 0], normals[:, 1])
+        is_flat = (
+            ~is_edge
+            & (dot(normals[:, 0], normals[:, 1]) > 0.0)
+            & (tf.norm(normal_cross, axis=-1) <= flat_tolerance)
+        )
+
+        # Locate the third vertex of the triangle associated with face 0.
+        face0_edge_indices = tf.boolean_mask(all_edges_index_1, is_selected)
+        face0_vertex = tf.gather(remaining_vertex, face0_edge_indices)
+
+        # Choose the tangent so that n_0 x e points into face 0.
+        edge_direction, _ = normalize(selected_wedges_end - selected_wedges_start)
+        face0_offset = face0_vertex - selected_wedges_start
+        points_into_face0 = dot(
+            cross(normals[:, 0], edge_direction), face0_offset
+        ) > 0.0
+
+        flat_e_hat = tf.where(points_into_face0[:, None], edge_direction, -edge_direction)
+        flat_origin = tf.where(
+            points_into_face0[:, None], selected_wedges_start, selected_wedges_end
+        )
+
+        e_hat = tf.where(is_flat[:, None], flat_e_hat, e_hat)
+        origin = tf.where(is_flat[:, None], flat_origin, origin)
+
+        # Flat wedges use the standard angular convention, not the concave branch.
+        is_concave_wedge = tf.where(is_flat, tf.zeros_like(is_concave_wedge), is_concave_wedge)
 
         # Output
         output = (
