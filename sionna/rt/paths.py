@@ -1169,6 +1169,15 @@ class PathsTmpData:
         self.sources = sources
         self.targets = targets
         self.dtype = dtype
+
+        # Flat transmission records, indexed before merging path families.
+        # Each path index is [target, source, path].
+        self.transmission_path_indices = tf.zeros([0, 3], tf.int32)
+        self.transmission_segments = tf.zeros([0], tf.int32)
+        self.transmission_primitives = tf.zeros([0], tf.int32)
+        self.transmission_t = tf.zeros([0], dtype.real_dtype)
+        self.transmission_order = tf.zeros([0], tf.int32)
+
         num_sources = tf.shape(sources)[0]
         num_targets = tf.shape(targets)[0]
 

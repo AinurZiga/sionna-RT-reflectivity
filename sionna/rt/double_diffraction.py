@@ -23,7 +23,7 @@ from .utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
         compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
             cot, cross, sign, rotation_matrix, acos_diff, rot_mat_from_unit_vecs, \
-            r_hat
+            r_hat, slab_coefficients
 
 if TYPE_CHECKING:
     from .solver_paths import SolverPaths
@@ -278,7 +278,88 @@ class DoubleDiffraction:
 
         return mask_coplanar
     
-    def discard_obstructing(self, candidate_pairs, sources, targets, return_indices=False):
+    def _junction_candidates(self, wedge_idxs, enabled):
+        """Identify flat shared edges with exactly one transmissive face."""
+        wd = self.solver_paths.solver_wedge_diffraction
+        faces = tf.gather(self._wedges_objects, wedge_idxs)
+        flags = tf.gather(enabled, faces)
+        return wd._is_flat_shared_wedge(wedge_idxs) & (flags[..., 0] != flags[..., 1])
+
+    def _vertex_has_junction(self, vertex_ids, enabled):
+        """Test whether a vertex has any eligible constituent edge."""
+        table = self.solver_paths.vertex_diffraction.vertices_2_wedges.to_tensor(default_value=-1)
+        wedges = tf.gather(table, vertex_ids)
+        safe = tf.maximum(wedges, 0)
+        return tf.reduce_any((wedges >= 0) & self._junction_candidates(safe, enabled), axis=-1)
+
+    def _junction_geometry(self, wedge_idxs, normal, tangent, n, incoming, outgoing,
+                           enabled, endpoint_swap=None):
+        """Select a virtual metal half-plane using the actual adjacent segment offsets."""
+        eligible = self._junction_candidates(wedge_idxs, enabled)
+        wd = self.solver_paths.solver_wedge_diffraction
+        plane_normal = tf.gather(self._wedges_normals[:, 0], wedge_idxs)
+        crossed = wd._opposite_sides(-dot(incoming, plane_normal), dot(outgoing, plane_normal))
+        junction = eligible & crossed
+
+        faces = tf.gather(self._wedges_objects, wedge_idxs)
+        glass_zero = tf.gather(enabled, faces[:, 0])
+        glass_object = tf.where(glass_zero, faces[:, 0], faces[:, 1])
+        if endpoint_swap is None:
+            # The edge tangent can be reversed while retaining the physical metal face.
+            flip_tangent = junction & glass_zero
+            tangent = tf.where(flip_tangent[:, None], -tangent, tangent)
+            back = eligible & (dot(incoming, normal) > 0.0)
+            normal = tf.where(back[:, None], -normal, normal)
+            tangent = tf.where(back[:, None], -tangent, tangent)
+        else:
+            # The vertex tangent must keep pointing away from the endpoint.
+            metal_is_face_one = glass_zero != endpoint_swap
+            back = eligible & ~junction & (dot(incoming, normal) > 0.0)
+            flip_normal = (junction & metal_is_face_one) | back
+            normal = tf.where(flip_normal[:, None], -normal, normal)
+
+        n = tf.where(junction, tf.cast(2.0, n.dtype), n)
+        return normal, tangent, n, junction, glass_object
+
+    def _junction_slab_matrix(self, junction, glass_objects, points, direction, normal,
+                              basis_s, basis_p, relative_permittivity):
+        """Return slab transmission in the corresponding outer-ray basis."""
+        indices = tf.cast(tf.where(junction), tf.int32)
+        transfer = tf.eye(2, batch_shape=tf.shape(junction), dtype=self._dtype)
+        if tf.shape(indices)[0] == 0:
+            return transfer
+
+        objects = tf.gather_nd(glass_objects, indices)
+        ray = tf.gather_nd(direction, indices)
+        normal = tf.gather_nd(normal, indices)
+        basis_s = tf.gather_nd(basis_s, indices)
+        basis_p = tf.gather_nd(basis_p, indices)
+        solver = self.solver_paths
+        rm_callable = solver._scene.radio_material_callable
+        if rm_callable is None:
+            eta = tf.gather(relative_permittivity, objects)
+        else:
+            eta, _, _ = rm_callable(objects, tf.gather_nd(points, indices))
+
+        _, _, t_s, t_p = slab_coefficients(
+            eta, tf.abs(dot(ray, normal, clip=True)),
+            tf.gather(solver._object_thickness, objects),
+            solver._scene.wavelength, dtype=self._dtype,
+        )
+        te, te_norm = normalize(cross(ray, normal))
+        te = tf.where((te_norm < 1e-7)[:, None], basis_s, te)
+        tm = cross(te, ray)
+        to_slab = tf.cast(component_transform(basis_s, basis_p, te, tm), self._dtype)
+        from_slab = tf.cast(component_transform(te, tm, basis_s, basis_p), self._dtype)
+        matrix = tf.matmul(from_slab, tf.stack([t_s, t_p], axis=-1)[..., None] * to_slab)
+        return tf.tensor_scatter_nd_update(transfer, indices, matrix)
+
+    def _unshifted_middle_visibility(self, point1, point2):
+        """Check the actual open segment between two diffraction points."""
+        direction, distance = normalize(point2 - point1)
+        return ~self.solver_paths._test_obstruction(point1, direction, distance)
+
+    def discard_obstructing(self, candidate_pairs, sources, targets, return_indices=False, junction_enabled=None):
         r"""
         Discard wedges for which at least one of the source or target are
         "inside" the wedge
@@ -320,6 +401,10 @@ class DoubleDiffraction:
         mask22 = self._discard_obstructing_wedges2(candidate_pairs[:, 1], w1_origin)
         mask2 = tf.logical_and(mask21, mask22[None, :])
         # is_edge2 = tf.gather(self.solver_paths.is_edge, candidate_pairs[:, 1], axis=0)
+
+        if junction_enabled is not None:
+            mask1 |= self._junction_candidates(candidate_pairs[:, 0], junction_enabled)[None, :]
+            mask2 |= self._junction_candidates(candidate_pairs[:, 1], junction_enabled)[None, :]
 
         # [num_sources, num_targets, num_dd_candidates]
         mask1 = tf.expand_dims(mask1, axis=1)
@@ -382,7 +467,7 @@ class DoubleDiffraction:
 
         return valid_pairs, new_mask
 
-    def _vertex_wedge_mask(self, paths, vertex_depth):
+    def _vertex_wedge_mask(self, paths, vertex_depth, junction_enabled=None):
         """Return [targets, sources, paths, vertex_wedges] validity."""
         if vertex_depth not in (0, 1):
             raise ValueError("vertex_depth must be 0 for VE or 1 for EV.")
@@ -434,6 +519,15 @@ class DoubleDiffraction:
 
         mask = valid_wedges & outside_wedge(before) & outside_wedge(after)
 
+        if junction_enabled is not None:
+            plane_normal = normals[..., 0, :]
+            d_before = dot(before[:, None, :] - origins, plane_normal)
+            d_after = dot(after[:, None, :] - origins, plane_normal)
+            wd = solver.solver_wedge_diffraction
+            crossed = wd._opposite_sides(d_before, d_after)
+            eligible = self._junction_candidates(safe_ids, junction_enabled)
+            mask |= valid_wedges & eligible & crossed
+
         # Reversing an edge tangent does not change this coplanarity test.
         edge_tangent = tf.gather(solver._wedges_e_hat, edge_ids)
         vertex_edge_tangent = tf.gather(solver._wedges_e_hat, safe_ids)
@@ -448,7 +542,7 @@ class DoubleDiffraction:
 
         return tf.scatter_nd(path_indices, mask, output_shape)
 
-    def discard_obstructing_dd_wedge_vertex(self, candidate_pairs, sources, targets):
+    def discard_obstructing_dd_wedge_vertex(self, candidate_pairs, sources, targets, junction_enabled=None):
         r"""
         Discard wedges for which at least one of the source or target are
         "inside" the wedge
@@ -483,6 +577,9 @@ class DoubleDiffraction:
         _, mask11 = self._discard_obstructing_wedges(candidate_pairs[:, 0], sources)
         mask12 = self._discard_obstructing_wedges2(candidate_pairs[:, 0], v_origin)
         mask1 = tf.logical_and(mask11, mask12[None, :])
+        if junction_enabled is not None:
+            mask1 |= self._junction_candidates(candidate_pairs[:, 0], junction_enabled)[None, :]
+
 
         # [num_sources, num_targets, num_candidates]
         mask1 = tf.expand_dims(mask1, axis=1)
@@ -540,7 +637,7 @@ class DoubleDiffraction:
 
         return valid_pairs, new_mask
 
-    def discard_obstructing_dd_vertex_wedge(self, candidate_pairs, sources, targets):
+    def discard_obstructing_dd_vertex_wedge(self, candidate_pairs, sources, targets, junction_enabled=None):
         # TODO: make function from above general ?
         r"""
 
@@ -570,9 +667,12 @@ class DoubleDiffraction:
         
         ## 1) prepare check points and wedges
         # [num_targets, num_dd_candidates]
-        _, mask11 = self._discard_obstructing_wedges(candidate_pairs[:, 1], sources)
+        _, mask11 = self._discard_obstructing_wedges(candidate_pairs[:, 1], targets)
         mask12 = self._discard_obstructing_wedges2(candidate_pairs[:, 1], v1_origin)
         mask1 = tf.logical_and(mask11, mask12[None, :])
+        if junction_enabled is not None:
+            mask1 |= self._junction_candidates(candidate_pairs[:, 1], junction_enabled)[None, :]
+
 
         # [num_sources, num_targets, num_candidates]
         mask1 = tf.expand_dims(mask1, axis=0)
@@ -1545,7 +1645,7 @@ class DoubleDiffraction:
 
         return mask
         
-    def check_preliminary_visibility(self, dd_pairs):
+    def check_preliminary_visibility(self, dd_pairs, junction_enabled=None):
         r"""
         Inputs
         ------
@@ -1583,9 +1683,12 @@ class DoubleDiffraction:
         is_edge = tf.math.reduce_any(tf.gather(self.solver_paths.is_edge, dd_pairs, axis=0), axis=-1)
         valid = tf.logical_or(valid, is_edge)
 
+        if junction_enabled is not None:
+            # Shifted midpoint rays can reject valid endpoint-to-endpoint paths.
+            valid |= tf.reduce_any(self._junction_candidates(dd_pairs, junction_enabled), axis=-1)
         return tf.boolean_mask(dd_pairs, valid, axis=0)
 
-    def _check_visibility(self, sources, targets, diff_points, dd_pair_idxs):
+    def _check_visibility(self, sources, targets, diff_points, dd_pair_idxs, junction_enabled=None):
         r"""
         Check visibility source -> diffraction_point1 -> diffraction_point2 -> target
 
@@ -1659,6 +1762,16 @@ class DoubleDiffraction:
         valid_w2w_edges = tf.logical_not(self.solver_paths._test_obstruction(diff_points1, d, maxt))
         valid_w2w = tf.logical_or(valid_w2w, valid_w2w_edges)
 
+        if junction_enabled is not None:
+            special = tf.reduce_any(self._junction_candidates(dd_pair_idxs_valid, junction_enabled), axis=-1)
+            special = tf.reshape(special, [-1])
+            rows = tf.cast(tf.where(special)[:, 0], tf.int32)
+            if tf.size(rows) > 0:
+                exact = self._unshifted_middle_visibility(
+                    tf.gather(diff_points1, rows), tf.gather(diff_points2, rows)
+                )
+                valid_w2w = tf.tensor_scatter_nd_update(valid_w2w, rows[:, None], exact)
+
         # 3) Check visibility between diff_points2 and target
         d, maxt = tf.linalg.normalize(targets - diff_points2, axis=1)
         maxt = tf.squeeze(maxt, axis=1)
@@ -1672,7 +1785,7 @@ class DoubleDiffraction:
 
         return valid
 
-    def check_visibility_mixed(self, sources, targets, diff_points, w_idxs, v_idxs):
+    def check_visibility_mixed(self, sources, targets, diff_points, w_idxs, v_idxs, junction_enabled=None):
         r"""
         Check visibility source -> diffraction_point1 -> diffraction_point2 -> target
 
@@ -1751,6 +1864,17 @@ class DoubleDiffraction:
         ## check edges separately, as they fail for such visibility checks
         valid_w2w_edges = tf.logical_not(self.solver_paths._test_obstruction(diff_points1, d, maxt))     
         valid_w2w = tf.logical_or(valid_w2w, valid_w2w_edges)
+
+        if junction_enabled is not None:
+            special = self._junction_candidates(vaild_w_idxs, junction_enabled)
+            special |= self._vertex_has_junction(vaild_v_idxs, junction_enabled)
+            special = tf.reshape(special, [-1])
+            rows = tf.cast(tf.where(special)[:, 0], tf.int32)
+            if tf.size(rows) > 0:
+                exact = self._unshifted_middle_visibility(
+                    tf.gather(diff_points1, rows), tf.gather(diff_points2, rows)
+                )
+                valid_w2w = tf.tensor_scatter_nd_update(valid_w2w, rows[:, None], exact)
 
         # 3) Check visibility between diff_points2 and target
         d, maxt = tf.linalg.normalize(targets - diff_points2, axis=1)
@@ -2105,6 +2229,7 @@ class DoubleDiffraction:
                                 paths: Paths, 
                                 paths_tmp: PathsTmpData):
         
+        transmission = getattr(paths_tmp, "junction_transmission", False)
         mask_wedge_wedge = tf.reduce_all(tf.reduce_all(paths.dd_type == 0, axis=1), axis=0)
         mask_wedge_vertex = tf.reduce_all(tf.reduce_all(paths.dd_type == 1, axis=1), axis=0)
         mask_vertex_wedge = tf.reduce_all(tf.reduce_all(paths.dd_type == 2, axis=1), axis=0)
@@ -2119,7 +2244,7 @@ class DoubleDiffraction:
         paths_tmp_wedge_wedge = paths_tmp.gather_paths(tf.where(mask_wedge_wedge)[:, 0])
         if tf.reduce_any(mask_wedge_wedge):
             mat_t_wedge_wedge = self.compute_fields_wedge_wedge(relative_permittivity, scattering_coefficient, 
-                                                                paths_wedge_wedge, paths_tmp_wedge_wedge)
+                                                                paths_wedge_wedge, paths_tmp_wedge_wedge, transmission=transmission)
             
         #### 1a) wedge-wedge shared vertex
         paths_sv = paths.gather_paths(tf.where(mask_shared_vertex)[:, 0], is_finalized=False)
@@ -2133,14 +2258,14 @@ class DoubleDiffraction:
         paths_tmp_wedge_vertex = paths_tmp.gather_paths(tf.where(mask_wedge_vertex)[:, 0])
         if tf.reduce_any(mask_wedge_vertex):
             mat_t_wedge_vertex = self.compute_fields_wedge_vertex(relative_permittivity, scattering_coefficient,
-                                                                   paths_wedge_vertex, paths_tmp_wedge_vertex)
+                                                                   paths_wedge_vertex, paths_tmp_wedge_vertex, transmission=transmission)
             
         ### 3) vertex-wedge
         paths_vw = paths.gather_paths(tf.where(mask_vertex_wedge)[:, 0], is_finalized=False)
         paths_tmp_vw = paths_tmp.gather_paths(tf.where(mask_vertex_wedge)[:, 0])
         if tf.reduce_any(mask_vertex_wedge):
             mat_t_vw = self.compute_fields_vertex_wedge(
-                relative_permittivity, scattering_coefficient, paths_vw, paths_tmp_vw
+                relative_permittivity, scattering_coefficient, paths_vw, paths_tmp_vw, transmission=transmission
             )
 
         if tf.reduce_any(mask_wedge_wedge):
@@ -2157,7 +2282,7 @@ class DoubleDiffraction:
         return mat_t
 
     def compute_fields_wedge_wedge(self, relative_permittivity, scattering_coefficient,
-                                paths: Paths, paths_tmp: PathsTmpData):
+                                paths: Paths, paths_tmp: PathsTmpData, transmission=False):
         r"""
         Compute EE fields for valid paths using flat intermediate tensors.
 
@@ -2205,20 +2330,30 @@ class DoubleDiffraction:
             l_hat, l = normalize(point2 - point1)
             r2_hat, r2 = normalize(targets - point2)
 
+            normal1, normal2 = normals1[:, 0], normals2[:, 0]
+            if transmission:
+                enabled = solver._object_transmission_enabled
+                normal1, e_hat1, n1, junction1, glass_obj1 = self._junction_geometry(
+                    wedge1, normal1, e_hat1, n1, point1 - sources, point2 - point1, enabled
+                )
+                normal2, e_hat2, n2, junction2, glass_obj2 = self._junction_geometry(
+                    wedge2, normal2, e_hat2, n2, point2 - point1, targets - point2, enabled
+                )
+
             phi1_prime, phi12, beta1_prime, _ = calc_angles(
-                normals1[:, 0], e_hat1, r1_hat, l_hat
+                normal1, e_hat1, r1_hat, l_hat
             )
             phi1_prime_c, phi12_c, _, _ = calc_angles_concave(
-                normals1[:, 0], e_hat1, r1_hat, l_hat, n1
+                normal1, e_hat1, r1_hat, l_hat, n1
             )
             phi1_prime = tf.where(n1 < 1.0, phi1_prime_c, phi1_prime)
             phi12 = tf.where(n1 < 1.0, phi12_c, phi12)
 
             phi12_prime, phi2, beta2_prime, _ = calc_angles(
-                normals2[:, 0], e_hat2, l_hat, r2_hat
+                normal2, e_hat2, l_hat, r2_hat
             )
             phi12_prime_c, phi2_c, _, _ = calc_angles_concave(
-                normals2[:, 0], e_hat2, l_hat, r2_hat, n2
+                normal2, e_hat2, l_hat, r2_hat, n2
             )
             phi12_prime = tf.where(n2 < 1.0, phi12_prime_c, phi12_prime)
             phi2 = tf.where(n2 < 1.0, phi2_c, phi2)
@@ -2248,14 +2383,25 @@ class DoubleDiffraction:
             beta2_hat = cross(phi2_hat, r2_hat)
 
             obj_geom = solver.obj_geom
-            if obj_geom is not None and obj_geom.is_glass_transmission:
+            if transmission:
+                glass1 = self._junction_slab_matrix(
+                    junction1, glass_obj1, point1, r1_hat, normal1,
+                    phi1_prime_hat, beta1_prime_hat, relative_permittivity,
+                )
+                # Use the reverse outer-ray basis at the exit, as in the legacy EE model.
+                glass2 = self._junction_slab_matrix(
+                    junction2, glass_obj2, point2, -r2_hat, normal2,
+                    phi2_hat, beta2_hat, relative_permittivity,
+                )
+                matrices = tf.matmul(glass2, tf.matmul(matrices, glass1))
+            elif obj_geom is not None and obj_geom.is_glass_transmission:
                 e_i_s1, e_i_p1, _, _ = compute_field_unit_vectors(
-                    r1_hat, l_hat, normals1[:, 0], solver.EPSILON
+                    r1_hat, l_hat, normal1, solver.EPSILON
                 )
 
                 # Preserve the reverse-direction convention at the second edge.
                 e_i_s2, e_i_p2, _, _ = compute_field_unit_vectors(
-                    -r2_hat, -l_hat, normals2[:, 0], solver.EPSILON
+                    -r2_hat, -l_hat, normal2, solver.EPSILON
                 )
                 mask = tf.ones_like(n1, dtype=tf.bool)
                 wavelength = solver._scene.wavelength
@@ -2264,14 +2410,14 @@ class DoubleDiffraction:
                     valid_wedges_idx=wedge1, n=n1, mask=mask,
                     phi_prime_hat=phi1_prime_hat, beta_0_prime_hat=beta1_prime_hat,
                     e_i_s_0=e_i_s1, e_i_p_0=e_i_p1,
-                    s_prime_hat=r1_hat, n_0_hat=normals1[:, 0],
+                    s_prime_hat=r1_hat, n_0_hat=normal1,
                     wavelength=wavelength, dtype=self._dtype
                 )
                 glass2 = obj_geom.diffraction_glass_transmission(
                     valid_wedges_idx=wedge2, n=n2, mask=mask,
                     phi_prime_hat=phi2_hat, beta_0_prime_hat=beta2_hat,
                     e_i_s_0=e_i_s2, e_i_p_0=e_i_p2,
-                    s_prime_hat=-r2_hat, n_0_hat=normals2[:, 0],
+                    s_prime_hat=-r2_hat, n_0_hat=normal2,
                     wavelength=wavelength, dtype=self._dtype
                 )
 
@@ -2331,10 +2477,17 @@ class DoubleDiffraction:
         sin_beta2 = tf.sin(beta2_prime)
         sin_product = sin_beta1 * sin_beta2
 
-        cos_ksi = (
-            dot(e_hat1, l_hat) * dot(e_hat2, l_hat) - dot(e_hat1, e_hat2)
-        ) / sin_product
-        sin_ksi = dot(cross(e_hat2, e_hat1), l_hat) / sin_product
+        # cos_ksi = (
+        #     dot(e_hat1, l_hat) * dot(e_hat2, l_hat) - dot(e_hat1, e_hat2)
+        # ) / sin_product
+        # sin_ksi = dot(cross(e_hat2, e_hat1), l_hat) / sin_product
+
+        l_unit, _ = normalize(l_hat)
+        u1, transverse1 = normalize(cross(e_hat1, l_unit))
+        u2, transverse2 = normalize(cross(e_hat2, l_unit))
+
+        cos_ksi = -dot(u1, u2, clip=True)
+        sin_ksi = dot(cross(u2, u1), l_unit)
 
         phi1_terms = _get_Phi1_pq(phi1_prime, phi12)
         phi2_terms = _get_Phi2_rs(phi2, phi12_prime)
@@ -2440,16 +2593,18 @@ class DoubleDiffraction:
         return matrices * -tf.cast(spreading[:, None, None], self._dtype)
 
     def compute_fields_vertex_wedge(self, relative_permittivity, scattering_coefficient,
-                                    paths: Paths, paths_tmp: PathsTmpData):
+                                    paths: Paths, paths_tmp: PathsTmpData, transmission=False):
         """Reuse the EV calculation through the existing path reversal convention."""
         reversed_paths, reversed_tmp = invert_s_t(paths, paths_tmp)
         matrices = self.compute_fields_wedge_vertex(
-            relative_permittivity, scattering_coefficient, reversed_paths, reversed_tmp
+            relative_permittivity, scattering_coefficient, reversed_paths, reversed_tmp,
+            transmission=transmission, reverse_junction=True,
         )
         return tf.transpose(matrices, perm=[1, 0, 2, 3, 4])
 
     def compute_fields_wedge_vertex(self, relative_permittivity, scattering_coefficient,
-                                    paths: Paths, paths_tmp: PathsTmpData):
+                                    paths: Paths, paths_tmp: PathsTmpData, transmission=False,
+                                    reverse_junction=False):
         solver = self.solver_paths
         scene = solver._scene
         vd = solver.vertex_diffraction
@@ -2487,14 +2642,33 @@ class DoubleDiffraction:
         r2_hat, r2 = normalize(targets - vertex_points)
         active = tf.ones_like(r1, dtype=tf.bool)
 
+        edge_geometry_override = None
+        vertex_geometry_override = None
+        if transmission:
+            enabled = solver._object_transmission_enabled
+            normals1, e1, n1 = solver.solver_wedge_diffraction._wedge_geometry(edge_ids)
+            e2, normal2, _, n2 = vd._vertex_edge_geometry(vertex_edge_ids, vertex_points)
+            normal1, e1, n1, junction1, glass_obj1 = self._junction_geometry(
+                edge_ids, normals1[:, 0], e1, n1, edge_points - sources, vertex_points - edge_points, enabled
+            )
+            normal2, e2, n2, junction2, glass_obj2 = self._junction_geometry(
+                vertex_edge_ids, normal2, e2, n2, vertex_points - edge_points, targets - vertex_points, enabled,
+                endpoint_swap=vd._vertex_edge_swap(vertex_edge_ids, vertex_points),
+            )
+            # Use overrides only on rows affected by the junction model.
+            edge_geometry_override = (normal1, e1, n1, self._junction_candidates(edge_ids, enabled))
+            vertex_geometry_override = (normal2, e2, n2)
+
         # Keep the original spreading factors included by these two helpers.
         d_a, a_values, edge_geometry = solver.solver_wedge_diffraction.simple_compute_fields(
-            edge_ids, r1_hat, l_hat, r1, l, active, skip_F=True
+            edge_ids, r1_hat, l_hat, r1, l, active, skip_F=True,
+            geometry_override=edge_geometry_override
         )
         e_hat1, n_0_hat1, n1, phi_prime1, phi1, beta_prime1 = edge_geometry
 
         d_b, param_b, param_c, vertex_geometry = vd._vertex_edge_coefficients_flat(
-            vertex_edge_ids, vertex_points, l_hat, r2_hat, l, r2, add_to_r1=r1
+            vertex_edge_ids, vertex_points, l_hat, r2_hat, l, r2, add_to_r1=r1,
+            geometry_override=vertex_geometry_override
         )
         e_hat2, n_0_hat2, n2, phi_prime2, phi2, beta_prime2, beta2 = vertex_geometry
 
@@ -2569,7 +2743,17 @@ class DoubleDiffraction:
         phi2_hat, _ = normalize(-cross(r2_hat, e_hat2))
         beta2_hat = cross(phi2_hat, r2_hat)
 
-        if solver.obj_geom is not None and solver.obj_geom.is_glass_transmission:
+        if transmission:
+            glass1 = self._junction_slab_matrix(
+                junction1, glass_obj1, edge_points, r1_hat, n_0_hat1,
+                phi1_prime_hat, beta1_prime_hat, relative_permittivity,
+            )
+            glass2 = self._junction_slab_matrix(
+                junction2, glass_obj2, vertex_points, -r2_hat, n_0_hat2,
+                phi2_hat, beta2_hat, relative_permittivity,
+            )
+            matrices = tf.matmul(glass2, tf.matmul(matrices, glass1))
+        elif solver.obj_geom is not None and solver.obj_geom.is_glass_transmission:
             e_i_s1, e_i_p1, _, _ = compute_field_unit_vectors(
                 r1_hat, l_hat, n_0_hat1, solver.EPSILON
             )
@@ -2604,6 +2788,12 @@ class DoubleDiffraction:
             phi1_prime_hat, beta1_prime_hat, phi2_hat, beta2_hat
         )
         matrices /= tf.cast(r1[:, None, None], self._dtype)
+
+        if transmission and reverse_junction:
+            # Reversed EV uses swapped endpoint bases. Transpose the reciprocal
+            # junction contribution before accumulating it into a VE path.
+            has_junction = junction1 | junction2
+            matrices = tf.where(has_junction[:, None, None], tf.linalg.matrix_transpose(matrices), matrices)
 
         path_ids = (path_indices[:, 0] * path_shape[1] + path_indices[:, 1]) * path_shape[2] + path_indices[:, 2]
         matrices = tf.math.unsorted_segment_sum(matrices, path_ids, tf.reduce_prod(path_shape))
@@ -2660,88 +2850,50 @@ class DoubleDiffraction:
         return valid_pairs, valid_vertices
 
     def compute_fields_sv(self, relative_permittivity, scattering_coefficient, paths, paths_tmp):
-        # mask = paths.mask
-        targets = paths.targets
-        sources = paths.sources
-        theta_t = paths.theta_t
-        phi_t = paths.phi_t
-        theta_r = paths.theta_r
-        phi_r = paths.phi_r
+        """Compute shared-vertex fields on valid paths, then restore the dense layout."""
+        solver = self.solver_paths
+        dtype = solver._scene.dtype
+        wavelength = solver._scene.wavelength
+        k = 2.0 * PI / wavelength
 
-        num_targets = targets.shape[0]
-        num_sources = sources.shape[0]
-        num_vertices = paths.vertices[0].shape[2]
+        shape = tf.shape(paths.mask)
+        output_shape = tf.concat([shape, [2, 2]], axis=0)
+        wedge1, wedge2 = paths.objects[0], paths.objects[1]
+        valid = paths.mask & (wedge1 >= 0) & (wedge2 >= 0)
+        indices = tf.cast(tf.where(valid), tf.int32)
 
-        dtype = self.solver_paths._scene.dtype
-        rdtype = self.solver_paths._scene._rdtype
+        if tf.shape(indices)[0] == 0:
+            self.delta_E = tf.zeros(shape, dtype)
+            self.c_sv = tf.zeros(shape, dtype.real_dtype)
+            self.pole_s = tf.zeros(shape, dtype.real_dtype)
+            self.res_hard = tf.zeros(shape, dtype)
+            return tf.zeros(output_shape, dtype)
 
-        valid_vertex_idxs = self.valid_vertex_idxs
+        diff_point = tf.gather_nd(paths.vertices[0], indices)
+        sources = tf.gather(paths.sources, indices[:, 1])
+        targets = tf.gather(paths.targets, indices[:, 0])
 
-        #normals = paths_tmp.normals
+        def edge_geometry(wedge_ids):
+            wedge_ids = tf.gather_nd(wedge_ids, indices)
+            normals = tf.gather(self._wedges_normals, wedge_ids)
+            cosine = dot(normals[:, 0], normals[:, 1], clip=True)
+            wedge_angle = PI - tf.acos(cosine)
+            n = (2.0 * PI - wedge_angle) / PI
+            e_hat = tf.gather(self._wedges_e_hat, wedge_ids)
+            origin = tf.gather(self._wedges_origin, wedge_ids)
 
-        wavelength = self.solver_paths._scene.wavelength
-        k = 2.0*PI/wavelength
+            # Preserve the original SV endpoint and face orientation convention.
+            swap = ~tf.reduce_all(tf.equal(origin, diff_point), axis=-1)
+            e_hat = tf.where(swap[:, None], -e_hat, e_hat)
+            n_0_hat = tf.where(swap[:, None], normals[:, 1], normals[:, 0])
+            return e_hat, n_0_hat, n
 
-        # sources -> diff_points1 -> diff_points2 -> targets
-        # [num_targets, num_sources, max_num_paths, 3]
-        diff_point = paths.vertices[0]
-        # [2, num_targets, num_sources, max_num_paths]
-        wedge_idxs = paths.objects
+        e_hat_w1, n_0_hat_1, n1 = edge_geometry(wedge1)
+        e_hat_w2, n_0_hat_2, n2 = edge_geometry(wedge2)
+        s_prime_hat, s_prime = normalize(diff_point - sources)
+        s_hat, s = normalize(targets - diff_point)
 
-        # [num_targets, num_sources, max_num_paths]
-        valid = tf.reduce_all(wedge_idxs != -1, axis=0)
-        # [2, num_targets, num_sources, max_num_paths]
-        valid_wedge_idxs = tf.where(valid, wedge_idxs, 0)
-
-        # Normals
-        # [2, num_targets, num_sources, max_num_paths, 2, 3]
-        normals = tf.gather(self._wedges_normals, valid_wedge_idxs, axis=0)
-
-        # Compute the wedges angle
-        # [2, num_targets, num_sources, max_num_paths]
-        cos_wedges_angle = dot(normals[...,0,:],normals[...,1,:], clip=True)
-        wedges_angle = PI - tf.math.acos(cos_wedges_angle)
-        n = (2.*PI-wedges_angle)/PI
-
-
-        # [num_targets, num_sources, max_num_paths]
-        n1 = tf.gather(n, 0, axis=0)
-        n2 = tf.gather(n, 1, axis=0)
-
-        # [2, num_targets, num_sources, max_num_paths, 3]
-        e_hat = tf.gather(self._wedges_e_hat, valid_wedge_idxs)
-
-        # [num_targets, num_sources, max_num_paths, 3]
-        e_hat_w1 = tf.gather(e_hat, 0, axis=0)
-        e_hat_w2 = tf.gather(e_hat, 1, axis=0)
-        wedge_origin1 = tf.gather(self._wedges_origin, valid_wedge_idxs[0])
-        wedge_origin2 = tf.gather(self._wedges_origin, valid_wedge_idxs[1])
-
-        # swap if wedge origin is not vertex_pos
-        needs_swap1 = tf.logical_not(tf.reduce_all(tf.math.equal(wedge_origin1, diff_point), axis=3))[..., None]
-        e_hat_w1 = tf.where(needs_swap1, -e_hat_w1, e_hat_w1)
-        n_0_hat_1 = tf.where(needs_swap1, normals[0, ...,1,:], normals[0, ...,0,:]) 
-        n_n_hat_1 = tf.where(needs_swap1, normals[0, ...,0,:], normals[0, ...,1,:])
-
-        # for edge 2
-        needs_swap2 = tf.logical_not(tf.reduce_all(tf.math.equal(wedge_origin2, diff_point), axis=3))[..., None]
-        e_hat_w2 = tf.where(needs_swap2, -e_hat_w2, e_hat_w2)
-        n_0_hat_2 = tf.where(needs_swap2, normals[1, ...,1,:], normals[1, ...,0,:]) 
-        n_n_hat_2 = tf.where(needs_swap2, normals[1, ...,0,:], normals[1, ...,1,:])
-
-        # Reshape sources and targets
-        # [1, num_sources, 1, 3]
-        sources = tf.reshape(sources, [1, -1, 1, 3])
-        # [num_targets, 1, 1, 3]
-        targets = tf.reshape(targets, [-1, 1, 1, 3])
-
-        # [num_targets, num_sources, max_num_paths, 3], [num_targets, num_sources, max_num_paths]
-        s_prime_hat, s_prime = normalize(diff_point-sources)
-        # [num_targets, num_sources, max_num_paths, 3], [num_targets, num_sources, max_num_paths]
-        s_hat, s = normalize(targets-diff_point)
-
-        # uniform_theta_sv
-        # [num_targets, num_sources, max_num_paths]
+        # [N]
         cos_alpha = tf.clip_by_value(
             tf.reduce_sum(e_hat_w1 * e_hat_w2, axis=-1),
             -1.0,
@@ -2751,41 +2903,36 @@ class DoubleDiffraction:
         alpha = tf.acos(cos_alpha)
         sin_alpha = tf.sin(alpha)
 
-        NUM_THETA = 80
-        # [num_theta, num_targets, num_sources, max_num_paths]
-        # theta = tf.cast(tf.linspace(1e-6, 1.0 - 1e-6, num_theta), alpha.dtype)[None,None,None,:] * (np.pi - alpha[..., None])
-        theta = tf.cast(tf.linspace(1e-2, 1.0 - 1e-2, NUM_THETA), alpha.dtype)[:, None,None,None] * (np.pi - alpha[None, ...])
+        NUM_THETA = 101
+        # [NUM_THETA, N]
+        theta = tf.cast(tf.linspace(1e-2, 1.0 - 1e-2, NUM_THETA), alpha.dtype)[:, None] * (np.pi - alpha[None, ...])
 
         # ----------------------------
         # C(theta), D(theta)
         # ----------------------------
 
-        # g1, g2 = g1_g2_at_vertex(P, S, V, t1, t2)
-        # [num_targets, num_sources, max_num_paths]
+        # [N]
         g1, g2 = g1_g2_at_vertex(e_hat_w1, e_hat_w2, s_prime_hat, s_hat)
 
-        # [num_theta, num_targets, num_sources, max_num_paths]
+        # [NUM_THETA, N]
         f1 = tf.sin(theta + alpha[None, ...]) / sin_alpha[None, ...]
         f2 = tf.sin(theta) / sin_alpha[None, ...]
 
-        # [num_theta, num_targets, num_sources, max_num_paths]
+        # [NUM_THETA, N]
         C = C_theta(theta, g1[None, ...], g2[None, ...], alpha[None, ...])
         D = D_theta(f1, f2, s_prime_hat[None, ...], s_hat[None, ...], s_prime[None, ...], s[None, ...], e_hat_w1[None, ...], e_hat_w2[None, ...])
 
-        # discard paths with C_theta < 0.0 (EE saddle exists)
-        # [num_targets, num_sources, max_num_paths]
-        # valid_C = tf.reduce_all(C >= 0.0, axis=0)
-        # paths.mask = paths.mask & valid_C
+        # [N]
         saddle_exist = tf.reduce_any(C < 0.0, axis=0)
         C = tf.abs(C)
-        # [num_targets, num_sources, max_num_paths, 3]
+        # [N]
         sign = tf.where(saddle_exist, -1.0, 1.0)
 
-        # [num_theta, num_targets, num_sources, max_num_paths, 3]
+        # [NUM_THETA, N, 3]
         r12_hat = f2[..., None] * e_hat_w2[None, ...] - f1[..., None] * e_hat_w1[None, ...]
         r12_hat, _ = normalize(r12_hat)    
 
-        # [num_theta, num_targets, num_sources, max_num_paths]
+        # [NUM_THETA, N]
         phi1_prime, phi12, beta1_prime, beta1 = calc_angles(n_0_hat_1[None, ...], e_hat_w1[None, ...], s_prime_hat[None, ...], r12_hat)
         phi12_prime, phi2, beta2_prime, beta2 = calc_angles(n_0_hat_2[None, ...], e_hat_w2[None, ...], r12_hat, s_hat[None, ...])
 
@@ -2796,15 +2943,10 @@ class DoubleDiffraction:
         u1 = self.solver_paths.vertex_diffraction._get_param_u(beta1_prime, beta1)
         u2 = self.solver_paths.vertex_diffraction._get_param_u(beta2_prime, beta2)
 
-        # [num_theta, num_targets, num_sources, max_num_paths]
+        # [NUM_THETA, N]
         b_signed = C * tf.sqrt(k) / (2.0 * tf.sqrt(D))
-        # tf.cast(b_signed, dtype)
-        # T = F_erfcx(b_signed, dtype)
         T = transition_func(b_signed**2)
-        # T = tf.cast(1.0, dtype)
 
-        los_dist = tf.norm(targets - sources, axis=-1)
-        geometric_b = (s_prime + s) - los_dist
 
         G1 = G_full_hard(phi12, phi1_prime, u1, n1)
         G2 = G_full_hard(phi2, phi12_prime, u2, n2)
@@ -2819,7 +2961,6 @@ class DoubleDiffraction:
             * T
             * tf.cast(wavelength, dtype)
             * tf.cast(4*PI / wavelength, dtype)
-            # * phase[None, ...]
             / tf.cast(4.0 * PI * s_prime[None, ...], dtype)
             / tf.cast(4.0 * PI * s[None, ...], dtype)
             / tf.cast(4.0 * PI, dtype)
@@ -2830,48 +2971,101 @@ class DoubleDiffraction:
         integrand = amp / tf.cast(sin_alpha, dtype)
 
         # integrate over theta-axis
-        # [num_targets, num_sources, max_num_paths]
+        # [N]
         res_hard = trapz_axis0(integrand, tf.cast(theta, dtype))
 
         res_hard *= tf.cast(sign, dtype)
 
-        mat_t1 = tf.stack([res_hard, tf.zeros_like(res_hard)], axis=-1)
-        mat_t2 = tf.stack([tf.zeros_like(res_hard), tf.zeros_like(res_hard)], axis=-1)
 
-        # [num_targets, num_sources, max_num_paths, 2, 2]
-        mat_t = tf.stack([mat_t1, mat_t2], axis=-2)
-        
-        theta_t = paths.theta_t
-        phi_t = paths.phi_t
-        theta_r = paths.theta_r
-        phi_r = paths.phi_r
 
-        # [num_targets, num_sources, max_num_paths, 3]
+        delta_E, c, pole_s = self._compute_sv_delta_flat(
+            k, s_prime, s, s_prime_hat, s_hat, e_hat_w1, e_hat_w2,
+            sin_alpha, cos_alpha, phi1_prime[0], phi2[0], phi12[0], phi12_prime[0],
+            n1, n2, dtype,
+        )
+        res_hard += delta_E
+
+        # self.delta_E = tf.scatter_nd(indices, delta_E, shape)
+        # self.c_sv = tf.scatter_nd(indices, c, shape)
+        # self.pole_s = tf.scatter_nd(indices, pole_s, shape)
+        # self.res_hard = tf.scatter_nd(indices, res_hard, shape)
+
+        mat_t = tf.linalg.diag(tf.stack([res_hard, tf.zeros_like(res_hard)], axis=-1))
+        theta_t = tf.gather_nd(paths.theta_t, indices)
+        phi_t = tf.gather_nd(paths.phi_t, indices)
+        theta_r = tf.gather_nd(paths.theta_r, indices)
+        phi_r = tf.gather_nd(paths.phi_r, indices)
+
         phi1_prime_hat, _ = normalize(cross(s_prime_hat, e_hat_w1))
         beta1_prime_hat = cross(phi1_prime_hat, s_prime_hat)
-
-        # [num_targets, num_sources, max_num_paths, 3]
         phi2_hat, _ = normalize(-cross(s_hat, e_hat_w2))
         beta2_hat = cross(phi2_hat, s_hat)
 
-        mat_t = self.solver_paths.convert_mat_t(mat_t, paths.mask, theta_t, phi_t, theta_r, phi_r, 
-                                                    phi1_prime_hat, beta1_prime_hat, phi2_hat, beta2_hat)
+        mat_t = solver.convert_mat_t(
+            mat_t, tf.ones_like(s_prime, dtype=tf.bool), theta_t, phi_t, theta_r, phi_r,
+            phi1_prime_hat, beta1_prime_hat, phi2_hat, beta2_hat,
+        )
+        return tf.scatter_nd(indices, mat_t, output_shape)
 
-        self.u1 = u1
-        self.u2 = u2
-        self.C = C
-        self.D = D
-        self.b_signed = b_signed
-        self.geometric_b = geometric_b
-        self.wedge_idxs = wedge_idxs
-        self.diff_point = diff_point
-        self.beta1_prime = beta1_prime
-        self.beta1 = beta1
-        self.beta2_prime = beta2_prime
-        self.beta2 = beta2
-        self.res_hard = res_hard * tf.cast(wavelength / (4*PI), dtype)
+    def _compute_sv_delta_flat(
+        self, k, s_prime, s, s_prime_hat, s_hat, e_hat_w1, e_hat_w2,
+        sin_alpha, cos_alpha, phi1_prime, phi2, q1, q2, n1, n2, dtype,
+    ):
+        """Evaluate the hard-polarization correction on admissible SV rows."""
+        pS = -s_prime * dot(s_prime_hat, e_hat_w1)
+        pP = s * dot(s_hat, e_hat_w2)
+        hS = tf.sqrt(tf.maximum(s_prime**2 - pS**2, 0.0))
+        hP = tf.sqrt(tf.maximum(s**2 - pP**2, 0.0))
 
-        return mat_t
+        hS_star = pS * sin_alpha + hS * cos_alpha
+        hP_star = pP * sin_alpha + hP * cos_alpha
+        p_star = pP * cos_alpha - hP * sin_alpha
+        Phi_s = tf.sqrt((pS - p_star)**2 + (hS + hP_star)**2)
+        Phi_v = s_prime + s
+
+        # Select rows before dividing by projected heights or evaluating GFI.
+        valid = (hS > 0.0) & (hP > 0.0) & (hS_star > 0.0) & (hP_star > 0.0) & (Phi_s > 0.0)
+        rows = tf.cast(tf.where(valid), tf.int32)
+        shape = tf.shape(s_prime)
+        if tf.shape(rows)[0] == 0:
+            return tf.zeros(shape, dtype), tf.zeros_like(s_prime), tf.zeros_like(s_prime)
+
+        def select(*values):
+            return tuple(tf.gather_nd(value, rows) for value in values)
+
+        pS, pP, hS, hP, hS_star, hP_star, Phi_s, Phi_v = select(
+            pS, pP, hS, hP, hS_star, hP_star, Phi_s, Phi_v
+        )
+        sin_alpha, cos_alpha, phi1_prime, phi2, q1, q2, n1, n2 = select(
+            sin_alpha, cos_alpha, phi1_prime, phi2, q1, q2, n1, n2
+        )
+
+        kap = sin_alpha / (1.0 + cos_alpha)
+        TS = tf.exp(tf.asinh(pS / hS))
+        TP = tf.exp(-tf.asinh(pP / hP))
+        f0 = TS - kap * TS * TP - kap - TP
+        c = -f0 * tf.sqrt(k * hS * hP / (TS * TP * (1.0 + kap**2) * (Phi_v + Phi_s)))
+
+        w = tf.sqrt(hS * hP / (hS_star * hP_star))
+        q1 = tf.where(tf.abs(q1) <= tf.abs(q1 - n1 * PI), tf.zeros_like(q1), n1 * PI)
+        q2 = tf.where(tf.abs(q2) <= tf.abs(q2 - n2 * PI), tf.zeros_like(q2), n2 * PI)
+        alpha1 = tf.sqrt(k * hS * hP_star / (2.0 * Phi_s))
+        alpha2 = tf.sqrt(k * hP * hS_star / (2.0 * Phi_s))
+        a_bar = 2.0 * alpha1 * tf.cos((phi1_prime - q1) / 2.0)
+        b_bar = 2.0 * alpha2 * tf.cos((phi2 - q2) / 2.0)
+        pole_s = w * tf.abs(a_bar) + tf.abs(b_bar)
+        sigma = tf.sign(a_bar * b_bar)
+
+        T_gfi = t_gfi_full_approximated_capolino(c**2, pole_s**2, self.obj_geom.diffraction_tables)
+        F_c = transition_func(c**2)
+        N = -8.0 * PI / (4.0 * PI)**3
+        delta_E = (
+            tf.cast(2.0 * PI * N * sigma / Phi_v, dtype)
+            / tf.cast(1j, dtype)
+            * tf.cast(pole_s / (c * (c**2 + pole_s**2)), dtype)
+            * (T_gfi - F_c)
+        )
+        return tuple(tf.scatter_nd(rows, value, shape) for value in (delta_E, c, pole_s))
 
 
 

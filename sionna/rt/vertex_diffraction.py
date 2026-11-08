@@ -16,8 +16,8 @@ from .paths import Paths, PathsTmpData
 from .diffraction_funcs import calc_angles, calc_angles_concave, func_G_approximated_capolino, t_gfi_full_approximated_capolino
 from .utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
-        compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
-            cot, cross, sign, rotation_matrix, acos_diff, rot_mat_from_unit_vecs
+        compute_field_unit_vectors, reflection_coefficient, slab_coefficients,\
+        cot, cross, acos_diff, material_reflection_coefficients
 
 if TYPE_CHECKING:
     from .solver_paths import SolverPaths
@@ -117,7 +117,7 @@ class VertexDiffraction:
 
         return output
 
-    def tracing(self, sources, targets, case="both", is_dd=False, edge_diffraction=True):
+    def tracing(self, sources, targets, case="both", is_dd=False, edge_diffraction=True, transmission=False):
         """
         Trace vertex diffracted paths between sources and targets.
         is_dd (double-diffraction) to get vertices for double-diffraction
@@ -173,14 +173,18 @@ class VertexDiffraction:
         # Only check for vertex visibility if there is at least one vertex-candidate
         if vertex_indices.shape[2] > 0: # Number of diff. paths > 0
             # Discard obstructed paths
-            vertex_indices, vertex_wedges_indices, diff_vertex_points, valid_vertex_idxs =\
-                self._check_vertices_visibility(targets, sources,
-                                                vertex_indices,
-                                                vertex_wedges_indices,
-                                                diff_vertex_points,
-                                                vertices_2_edges_row_lengths,
-                                                case,
-                                                ) 
+            if transmission and not is_dd and case == "both":
+                vertex_indices = self.solver_paths.solver_reflection._trace_diffraction_transmissions(
+                    vertex_indices, diff_vertex_points, sources, targets, vd_paths_tmp
+                )
+            else:
+                vertex_indices, vertex_wedges_indices, diff_vertex_points, valid_vertex_idxs = (
+                    self._check_vertices_visibility(
+                        targets, sources, vertex_indices, vertex_wedges_indices,
+                        diff_vertex_points, vertices_2_edges_row_lengths, case,
+                    )
+                )
+        
             vd_paths, vd_paths_tmp = \
                 self._vertex_diffraction_create_paths(vd_paths, vd_paths_tmp, vertex_indices, \
                                                        diff_vertex_points)
@@ -192,30 +196,6 @@ class VertexDiffraction:
             vd_paths.objects = tf.where(vd_paths.mask[None, ...], vd_paths.objects, -1)
 
         return vd_paths, vd_paths_tmp
-
-    # def _visible_vertex_wedges(self, paths, case):
-    #     vertex_idxs = paths.objects[0]
-    #     safe_vertices = tf.where(vertex_idxs >= 0, vertex_idxs, 0)
-
-    #     wedges = tf.gather(self.vertices_2_wedges.to_tensor(default_value=-1), safe_vertices)
-    #     present = (wedges >= 0) & (vertex_idxs[..., None] >= 0)
-    #     safe_wedges = tf.where(wedges >= 0, wedges, 0)
-
-    #     origins = tf.gather(self._wedges_origin, safe_wedges)
-    #     normals = tf.gather(self._wedges_normals, safe_wedges)
-    #     is_edge = tf.gather(self.solver_paths._is_edge, safe_wedges)
-    #     eps = tf.cast(self.solver_paths.EPSILON, self._rdtype)
-
-    #     if case in ("both", "tx"):
-    #         vectors = paths.sources[None, :, None, None, None, :] - origins[..., None, :]
-    #         tx_valid = tf.reduce_any(tf.reduce_sum(vectors * normals, axis=-1) > eps, axis=-1)
-
-    #     if case in ("both", "rx"):
-    #         vectors = paths.targets[:, None, None, None, None, :] - origins[..., None, :]
-    #         rx_valid = tf.reduce_any(tf.reduce_sum(vectors * normals, axis=-1) > eps, axis=-1)
-
-    #     valid = tx_valid & rx_valid if case == "both" else tx_valid if case == "tx" else rx_valid
-    #     return present & (valid | is_edge)
 
     def _visible_vertex_wedges(self, paths, case, edge_diffraction=True):
         """Select existing constituent wedges, optionally excluding single-face edges.
@@ -626,13 +606,51 @@ class VertexDiffraction:
         theta_r = tf.gather_nd(paths.theta_r, path_indices)
         phi_r = tf.gather_nd(paths.phi_r, path_indices)
 
-        etas, scattering = self._vertex_edge_materials(
-            relative_permittivity, scattering_coefficient, wedge_idxs, points
-        )
-        edge_matrices = self._vertex_edge_matrices(
-            wedge_idxs, points, sources, targets, etas, scattering,
-            theta_t, phi_t, theta_r, phi_r
-        )
+        wd = self.solver_paths.solver_wedge_diffraction
+        crossed_flat = tf.zeros_like(wedge_idxs, dtype=tf.bool)
+        transmitted = tf.zeros_like(wedge_idxs, dtype=tf.bool)
+
+        if getattr(paths_tmp, "junction_transmission", False):
+            origins = tf.gather(self.solver_paths._wedges_origin, wedge_idxs)
+            normals = tf.gather(self.solver_paths._wedges_normals[:, 0], wedge_idxs)
+            d_tx = dot(sources - origins, normals)
+            d_rx = dot(targets - origins, normals)
+
+            crossed_flat = wd._is_flat_shared_wedge(wedge_idxs) & wd._opposite_sides(d_tx, d_rx)
+
+            face_objects = tf.gather(self.solver_paths._wedges_objects, wedge_idxs)
+            enabled = tf.gather(self.solver_paths._object_transmission_enabled, face_objects)
+            mixed = tf.math.logical_xor(enabled[:, 0], enabled[:, 1])
+            transmitted = crossed_flat & mixed
+
+        ordinary_rows = tf.where(~crossed_flat)
+        transmitted_rows = tf.where(transmitted)
+        edge_matrices = tf.zeros([tf.shape(wedge_idxs)[0], 2, 2], dtype=self._dtype)
+
+        def compute_rows(rows, metal_knife_edge):
+            selected_wedges = tf.gather_nd(wedge_idxs, rows)
+            selected_points = tf.gather_nd(points, rows)
+            etas, scattering = self._vertex_edge_materials(
+                relative_permittivity, scattering_coefficient, selected_wedges, selected_points
+            )
+            return self._vertex_edge_matrices(
+                selected_wedges, selected_points,
+                tf.gather_nd(sources, rows), tf.gather_nd(targets, rows),
+                etas, scattering,
+                tf.gather_nd(theta_t, rows), tf.gather_nd(phi_t, rows),
+                tf.gather_nd(theta_r, rows), tf.gather_nd(phi_r, rows),
+                metal_knife_edge=metal_knife_edge,
+            )
+
+        if tf.shape(ordinary_rows)[0] > 0:
+            edge_matrices = tf.tensor_scatter_nd_update(
+                edge_matrices, ordinary_rows, compute_rows(ordinary_rows, False)
+            )
+
+        if tf.shape(transmitted_rows)[0] > 0:
+            edge_matrices = tf.tensor_scatter_nd_update(
+                edge_matrices, transmitted_rows, compute_rows(transmitted_rows, True)
+            )
 
         path_ids = (path_indices[:, 0] * shape[1] + path_indices[:, 1]) * shape[2] + path_indices[:, 2]
         matrices = tf.math.unsorted_segment_sum(edge_matrices, path_ids, tf.reduce_prod(shape))
@@ -655,85 +673,73 @@ class VertexDiffraction:
         etas, scattering, _ = rm_callable(object_idxs, material_points)
         return etas, scattering
 
-
-    # def _vertex_edge_matrices(self, wedge_idxs, points, sources, targets, etas, scattering,
-    #                         theta_t, phi_t, theta_r, phi_r):
-    #     wavelength = self.solver_paths._scene.wavelength
-    #     k = 2.0 * PI / wavelength
-
-    #     e_hat, n_0_hat, n_n_hat, wedge_n = self._vertex_edge_geometry(wedge_idxs, points)
-
-    #     # Keep material ordering consistent with the face swap in _vertex_edge_geometry.
-    #     # origins = tf.gather(self.solver_paths._wedges_origin, wedge_idxs)
-    #     # swap = ~tf.reduce_all(tf.equal(origins, points), axis=-1)
-
-    #     # Match material ordering to the oriented wedge faces exactly once.
-    #     swap = self._vertex_edge_swap(wedge_idxs, points)
-    #     etas = tf.where(swap[:, None], tf.reverse(etas, axis=[1]), etas)
-    #     scattering = tf.where(swap[:, None], tf.reverse(scattering, axis=[1]), scattering)
-
-    #     s_prime_hat, s_prime = normalize(points - sources)
-    #     s_hat, s = normalize(targets - points)
-    #     phi_prime_hat, _ = normalize(cross(s_prime_hat, e_hat))
-    #     beta_0_prime_hat = cross(phi_prime_hat, s_prime_hat)
-    #     phi_hat_, _ = normalize(-cross(s_hat, e_hat))
-    #     beta_0_hat = cross(phi_hat_, s_hat)
-
-    #     phi_prime, phi, beta_prime, beta = calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat)
-    #     phi_prime_c, phi_c, beta_prime, beta = calc_angles_concave(
-    #         n_0_hat, e_hat, s_prime_hat, s_hat, wedge_n
-    #     )
-    #     phi_prime = tf.where(wedge_n < 1.0, phi_prime_c, phi_prime)
-    #     phi = tf.where(wedge_n < 1.0, phi_c, phi)
-
-    #     e_i_s_0, e_i_p_0, e_r_s_0, e_r_p_0 = compute_field_unit_vectors(
-    #         s_prime_hat, s_hat, n_0_hat, self.solver_paths.EPSILON
-    #     )
-    #     e_i_s_n, e_i_p_n, e_r_s_n, e_r_p_n = compute_field_unit_vectors(
-    #         s_prime_hat, s_hat, n_n_hat, self.solver_paths.EPSILON
-    #     )
-
-    #     r_s_0, r_p_0 = reflection_coefficient(etas[:, 0], tf.abs(tf.sin(phi_prime)))
-    #     r_s_n, r_p_n = reflection_coefficient(etas[:, 1], tf.abs(tf.sin(wedge_n * PI - phi)))
-    #     reduction_0 = tf.cast(tf.sqrt(1.0 - scattering[:, 0]**2), self._dtype)
-    #     reduction_n = tf.cast(tf.sqrt(1.0 - scattering[:, 1]**2), self._dtype)
-    #     r_s_0 *= reduction_0
-    #     r_p_0 *= reduction_0
-    #     r_s_n *= reduction_n
-    #     r_p_n *= reduction_n
-
     def _vertex_edge_matrices(self, wedge_idxs, points, sources, targets, etas, scattering,
-                            theta_t, phi_t, theta_r, phi_r):
+                            theta_t, phi_t, theta_r, phi_r, metal_knife_edge=False):
         wavelength = self.solver_paths._scene.wavelength
         k = 2.0 * PI / wavelength
 
         e_hat, n_0_hat, n_n_hat, wedge_n = self._vertex_edge_geometry(wedge_idxs, points)
 
+        object_idxs = tf.gather(self.solver_paths._wedges_objects, wedge_idxs)
+
         # Match material ordering to the endpoint orientation exactly once.
         swap = self._vertex_edge_swap(wedge_idxs, points)
         etas = tf.where(swap[:, None], tf.reverse(etas, axis=[1]), etas)
         scattering = tf.where(swap[:, None], tf.reverse(scattering, axis=[1]), scattering)
+        object_idxs = tf.where(swap[:, None], tf.reverse(object_idxs, axis=[1]), object_idxs)
 
         s_prime_hat, s_prime = normalize(points - sources)
         s_hat, s = normalize(targets - points)
 
-        # Locate the source in the original oriented cross-sectional plane.
-        t_0_hat = cross(n_0_hat, e_hat)
-        source_phi = tf.math.floormod(
-            tf.atan2(-dot(s_prime_hat, n_0_hat), -dot(s_prime_hat, t_0_hat)),
-            2.0 * PI,
-        )
-        use_other_sector = source_phi > wedge_n * PI
+        incident_slab_coeffs = None
 
-        # Preserve the tangent pointing away from the vertex.
-        # The complementary sector starts at the original n-face.
-        original_n_0, original_n_n = n_0_hat, n_n_hat
-        n_0_hat = tf.where(use_other_sector[:, None], -original_n_n, original_n_0)
-        n_n_hat = tf.where(use_other_sector[:, None], -original_n_0, original_n_n)
-        wedge_n = tf.where(use_other_sector, 2.0 - wedge_n, wedge_n)
+        if metal_knife_edge:
+            enabled = tf.gather(self.solver_paths._object_transmission_enabled, object_idxs)
+            glass_face = tf.cast(~enabled[:, 0], tf.int32)
+            metal_face = 1 - glass_face
 
-        etas = tf.where(use_other_sector[:, None], tf.reverse(etas, axis=[1]), etas)
-        scattering = tf.where(use_other_sector[:, None], tf.reverse(scattering, axis=[1]), scattering)
+            glass_objects = tf.gather(object_idxs, glass_face, axis=1, batch_dims=1)
+            metal_objects = tf.gather(object_idxs, metal_face, axis=1, batch_dims=1)
+            glass_eta = tf.gather(etas, glass_face, axis=1, batch_dims=1)
+            metal_eta = tf.gather(etas, metal_face, axis=1, batch_dims=1)
+            metal_scattering = tf.gather(scattering, metal_face, axis=1, batch_dims=1)
+
+            # Keep the outward vertex tangent and point cross(n_0_hat, e_hat)
+            # into the metal half-plane.
+            n_0_hat = tf.where((metal_face == 0)[:, None], n_0_hat, -n_0_hat)
+            n_n_hat = -n_0_hat
+            wedge_n = tf.fill(tf.shape(wedge_n), tf.cast(2.0, wedge_n.dtype))
+            etas = tf.stack([metal_eta, metal_eta], axis=1)
+            scattering = tf.stack([metal_scattering, metal_scattering], axis=1)
+            object_idxs = tf.stack([metal_objects, metal_objects], axis=1)
+
+            _, _, t_s, t_p = slab_coefficients(
+                glass_eta, tf.abs(dot(s_prime_hat, n_0_hat, clip=True)),
+                tf.gather(self.solver_paths._object_thickness, glass_objects),
+                wavelength, dtype=self._dtype,
+            )
+            incident_slab_coeffs = (t_s, t_p)
+        else:
+            # Locate the source in the original oriented cross-sectional plane.
+            t_0_hat = cross(n_0_hat, e_hat)
+            source_phi = tf.math.floormod(
+                tf.atan2(-dot(s_prime_hat, n_0_hat), -dot(s_prime_hat, t_0_hat)),
+                2.0 * PI,
+            )
+            use_other_sector = source_phi > wedge_n * PI
+
+            # Preserve the tangent pointing away from the vertex.
+            # The complementary sector starts at the original n-face.
+            original_n_0, original_n_n = n_0_hat, n_n_hat
+            n_0_hat = tf.where(use_other_sector[:, None], -original_n_n, original_n_0)
+            n_n_hat = tf.where(use_other_sector[:, None], -original_n_0, original_n_n)
+            wedge_n = tf.where(use_other_sector, 2.0 - wedge_n, wedge_n)
+
+            etas = tf.where(use_other_sector[:, None], tf.reverse(etas, axis=[1]), etas)
+            scattering = tf.where(use_other_sector[:, None], tf.reverse(scattering, axis=[1]), scattering)
+            object_idxs = tf.where(
+                use_other_sector[:, None], tf.reverse(object_idxs, axis=[1]), object_idxs
+            )
 
         phi_prime_hat, _ = normalize(cross(s_prime_hat, e_hat))
         beta_0_prime_hat = cross(phi_prime_hat, s_prime_hat)
@@ -757,8 +763,17 @@ class VertexDiffraction:
         # Use the full 3D incidence angle, matching ordinary WD.
         cos_theta_0 = tf.abs(dot(s_prime_hat, n_0_hat, clip=True))
         cos_theta_n = tf.abs(dot(s_prime_hat, n_n_hat, clip=True))
-        r_s_0, r_p_0 = reflection_coefficient(etas[:, 0], cos_theta_0)
-        r_s_n, r_p_n = reflection_coefficient(etas[:, 1], cos_theta_n)
+        face_cos_theta = tf.stack([cos_theta_0, cos_theta_n], axis=-1)
+
+        # Object indices already follow both face permutations.
+        face_thickness = tf.gather(self.solver_paths._object_thickness, object_idxs)
+        face_slab_enabled = tf.gather(self.solver_paths._object_transmission_enabled, object_idxs)
+
+        face_r_s, face_r_p = material_reflection_coefficients(
+            etas, face_cos_theta, face_thickness, face_slab_enabled, wavelength
+        )
+        r_s_0, r_s_n = face_r_s[:, 0], face_r_s[:, 1]
+        r_p_0, r_p_n = face_r_p[:, 0], face_r_p[:, 1]
 
         reduction_0 = tf.cast(tf.sqrt(1.0 - scattering[:, 0]**2), self._dtype)
         reduction_n = tf.cast(tf.sqrt(1.0 - scattering[:, 1]**2), self._dtype)
@@ -801,7 +816,18 @@ class VertexDiffraction:
         mat_t = (d1 + d2)[:, None, None] * eye + d3[:, None, None] * r_n + d4[:, None, None] * r_0
         mat_t *= -tf.cast((1.0 / s)[:, None, None], self._dtype)
 
-        if self.solver_paths.obj_geom is not None and self.solver_paths.obj_geom.is_glass_transmission:
+        if incident_slab_coeffs is not None:
+            t_s, t_p = incident_slab_coeffs
+            mat_to_sp = tf.cast(component_transform(
+                phi_prime_hat, beta_0_prime_hat, e_i_s_0, e_i_p_0
+            ), self._dtype)
+            mat_from_sp = tf.cast(component_transform(
+                e_i_s_0, e_i_p_0, phi_prime_hat, beta_0_prime_hat
+            ), self._dtype)
+            transmission = tf.stack([t_s, t_p], axis=-1)
+            glass = tf.matmul(mat_from_sp, transmission[..., None] * mat_to_sp)
+            mat_t = tf.matmul(mat_t, glass)
+        elif self.solver_paths.obj_geom is not None and self.solver_paths.obj_geom.is_glass_transmission:
             glass = self.solver_paths.obj_geom.diffraction_glass_transmission(
                 valid_wedges_idx=wedge_idxs, n=wedge_n, mask=tf.ones_like(wedge_n, dtype=tf.bool),
                 phi_prime_hat=phi_prime_hat, beta_0_prime_hat=beta_0_prime_hat,
@@ -820,7 +846,6 @@ class VertexDiffraction:
         ), self._dtype)
         mat_t = tf.matmul(mat_to_gcs, tf.matmul(mat_t, mat_from_gcs))
         return self._clear_vertex_edge_nan(mat_t)
-
 
     def _clear_vertex_edge_nan(self, value):
         return tf.where(tf.math.is_nan(tf.math.real(value)), tf.zeros_like(value), value)
@@ -1461,9 +1486,12 @@ class VertexDiffraction:
         return distance_end < distance_origin
 
     def _vertex_edge_coefficients_flat(self, wedge_idxs, points, s_prime_hat, s_hat,
-                                    s_prime, s, add_to_r1=None):
+                                    s_prime, s, add_to_r1=None, geometry_override=None):
         """Compute selected VD coefficients without their transition function."""
         e_hat, n_0_hat, _, wedge_n = self._vertex_edge_geometry(wedge_idxs, points, use_isclose=True)
+
+        if geometry_override is not None:
+            n_0_hat, e_hat, wedge_n = geometry_override
 
         phi_prime, phi, beta_prime, beta = calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat)
         phi_prime_c, phi_c, _, _ = calc_angles_concave(n_0_hat, e_hat, s_prime_hat, s_hat, wedge_n)

@@ -430,6 +430,38 @@ class SolverBase:
                rot_motion_axis,
                rot_motion_angular_velocity)
 
+    def _build_slab_properties_tensors(self, array_size):
+        """Build slab thickness and transmission flags indexed by object ID.
+
+        Parameters
+        ----------
+        array_size : int or scalar tf.Tensor
+            Size of the object-property arrays, including unused IDs.
+
+        Returns
+        -------
+        thickness : tf.Tensor, shape [array_size]
+            Slab thicknesses [m].
+        transmission_enabled : tf.Tensor, bool, shape [array_size]
+            Flags selecting the slab model.
+        """
+        thickness = tf.zeros([array_size], self._rdtype)
+        transmission_enabled = tf.zeros([array_size], tf.bool)
+
+        for material in self._scene.radio_materials.values():
+            object_ids = tf.reshape(material.using_objects, [-1, 1])
+            count = tf.shape(object_ids)[0]
+
+            thickness = tf.tensor_scatter_nd_update(
+                thickness, object_ids, tf.fill([count], material.thickness)
+            )
+            transmission_enabled = tf.tensor_scatter_nd_update(
+                transmission_enabled, object_ids,
+                tf.fill([count], material.transmission_enabled)
+            )
+
+        return thickness, transmission_enabled
+
     def _test_obstruction(self, o, d, maxt, info=False):
         r"""
         Test obstruction of a batch of rays using Mitsuba.

@@ -23,29 +23,45 @@ CALC = 'TF'  # ['TF, 'Umul']
 ## diffraction tables
 ######################################
 
-# class DiffractionTables:
-#     def __init__(self, dtype=tf.complex64):
-#         self.dtype = dtype
-#         self.gfi_DIV = 0.0025
-#         file_gfi_table = Path(__file__).resolve().parent / "data" / "gfi_00025.npy"
-#         self.gfi_table_tf = tf.convert_to_tensor(np.load(file_gfi_table), dtype=dtype)
-
-#         self.file_T_ev_1 = Path(__file__).resolve().parent / "data" / "T_ev_even_linear_table_new.npz"
-#         self.file_T_ev_2 = Path(__file__).resolve().parent / "data" / "T_ev_odd_linear_table_new.npz"
-
 class DiffractionTables:
-    """Load shared GFI tables once and retain paths to EV transition tables."""
+    """Load the GFI lookup and retain paths to the EV transition tables."""
 
     def __init__(self, dtype=tf.complex64, use_gfi_lookup=True, gfi_filename=None):
         self.dtype = tf.as_dtype(dtype)
         data_dir = Path(__file__).resolve().parent / "data"
-        gfi_filename = data_dir / "gfi_hybrid_tables2.npz" if gfi_filename is None else Path(gfi_filename)
 
-        self.gfi_lookup = GFILookup(gfi_filename, dtype=self.dtype) if use_gfi_lookup else None
+        self.gfi_DIV = 0.0025
+        self.gfi_table_tf = None
+        self.gfi_lookup = None
 
-        # These independent EV tables are still required by double diffraction.
-        self.file_T_ev_1 = data_dir / "T_ev_even_linear_table_new.npz"
-        self.file_T_ev_2 = data_dir / "T_ev_odd_linear_table_new.npz"
+        if use_gfi_lookup:
+            file_gfi_table = data_dir / "gfi_00025.npy" if gfi_filename is None else Path(gfi_filename)
+
+            if file_gfi_table.suffix == ".npy":
+                self.gfi_table_tf = tf.convert_to_tensor(
+                    np.load(file_gfi_table, allow_pickle=False), dtype=self.dtype
+                )
+            elif file_gfi_table.suffix == ".npz":
+                self.gfi_lookup = GFILookup(file_gfi_table, dtype=self.dtype)
+            else:
+                raise ValueError(f"Unsupported GFI table format: {file_gfi_table}")
+
+        self.file_T_ev_1 = data_dir / "T_ev_even_linear_table.npz"
+        self.file_T_ev_2 = data_dir / "T_ev_odd_linear_table.npz"
+
+# class DiffractionTables:
+#     """Load shared GFI tables once and retain paths to EV transition tables."""
+
+#     def __init__(self, dtype=tf.complex64, use_gfi_lookup=True, gfi_filename=None):
+#         self.dtype = tf.as_dtype(dtype)
+#         data_dir = Path(__file__).resolve().parent / "data"
+#         gfi_filename = data_dir / "gfi_hybrid_tables2.npz" if gfi_filename is None else Path(gfi_filename)
+
+#         self.gfi_lookup = GFILookup(gfi_filename, dtype=self.dtype) if use_gfi_lookup else None
+
+#         # These independent EV tables are still required by double diffraction.
+#         self.file_T_ev_1 = data_dir / "T_ev_even_linear_table_new.npz"
+#         self.file_T_ev_2 = data_dir / "T_ev_odd_linear_table_new.npz"
 
 
 def calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat):
@@ -292,106 +308,57 @@ def func_G_approximated_capolino(x, y, table: DiffractionTables = None):
     y = tf.reshape(tf.broadcast_to(y, initial_shape), [-1])
 
     gfi_sign = sign(x) * sign(y)
-    values = _func_G_approximated_capolino2(tf.abs(x), tf.abs(y))
+
+    # values = _func_G_approximated_capolino2(tf.abs(x), tf.abs(y))
+    # values *= tf.cast(gfi_sign, values.dtype)
+
+    if table is not None and table.gfi_table_tf is not None:
+        x_abs = tf.cast(tf.abs(x), table.dtype.real_dtype)
+        y_abs = tf.cast(tf.abs(y), table.dtype.real_dtype)
+        values = _func_G_table2(x_abs, y_abs, table)
+    else:
+        values = _func_G_approximated_capolino2(tf.abs(x), tf.abs(y))
+
     values *= tf.cast(gfi_sign, values.dtype)
 
     return tf.reshape(values, initial_shape)
 
 def _func_G_table2_regular(x, y, table: DiffractionTables):
-    dtype = table.dtype
-    table_tf = table.gfi_table_tf
-    DIV = table.gfi_DIV
+    """Interpolate nonnegative arguments on the uniform GFI grid."""
+    values = table.gfi_table_tf
+    div = tf.cast(table.gfi_DIV, x.dtype)
+    gx, gy = x / div, y / div
 
-    cond_approx1_idxs = tf.where(tf.math.logical_or(x >= 3.0, y >= 3.0))[:, 0]
-    table_cond_idxs = tf.where(tf.math.logical_and(x < 3.0, y < 3.0))[:, 0]
+    i = tf.clip_by_value(tf.cast(tf.floor(gx), tf.int32), 0, tf.shape(values)[0] - 2)
+    j = tf.clip_by_value(tf.cast(tf.floor(gy), tf.int32), 0, tf.shape(values)[1] - 2)
 
-    def _from_table(x_table, y_table):
-        x_idx = tf.cast(tf.math.floor(x_table / DIV), tf.int32)
-        y_idx = tf.cast(tf.math.floor(y_table / DIV), tf.int32)
-        ##
-        x_idx = tf.where(x_idx < 0, tf.zeros_like(x_idx), x_idx)
-        x_idx = tf.where(x_idx >= tf.shape(table_tf)[0]-2, tf.zeros_like(x_idx), x_idx)
-        y_idx = tf.where(y_idx < 0, tf.zeros_like(y_idx), y_idx)
-        y_idx = tf.where(y_idx >= tf.shape(table_tf)[1]-2, tf.zeros_like(y_idx), y_idx)
-        ##
-        idxs = tf.stack([x_idx, y_idx], axis=-1)
-        idxs_10 = tf.stack([x_idx + 1, y_idx], axis=-1)
-        idxs_01 = tf.stack([x_idx, y_idx + 1], axis=-1)
-        idxs_11 = tf.stack([x_idx + 1, y_idx + 1], axis=-1)
+    u, v = gx - tf.cast(i, x.dtype), gy - tf.cast(j, y.dtype)
+    return GFILookup._bilinear(values, i, j, u, v)
 
-        table_00 = tf.gather_nd(table_tf, idxs)
-        table_10 = tf.gather_nd(table_tf, idxs_10)
-        table_01 = tf.gather_nd(table_tf, idxs_01)
-        table_11 = tf.gather_nd(table_tf, idxs_11)
-
-        # bilinear interpolation
-        x1 = tf.cast(x_idx, x.dtype) * DIV
-        x2 = tf.cast(x_idx + 1, x.dtype) * DIV
-        y1 = tf.cast(y_idx, x.dtype) * DIV
-        y2 = tf.cast(y_idx + 1, x.dtype) * DIV
-        res = table_00 * tf.cast((x2 - x_table)/DIV, dtype) * tf.cast((y2 - y_table)/DIV, dtype) + \
-                table_10 * tf.cast((x_table - x1)/DIV, dtype) * tf.cast((y2 - y_table)/DIV, dtype) + \
-                table_01 * tf.cast((x2 - x_table)/DIV, dtype) * tf.cast((y_table - y1)/DIV, dtype) + \
-                table_11 * tf.cast((x_table - x1)/DIV, dtype) * tf.cast((y_table - y1)/DIV, dtype)
-        
-        return res
-
-    res_approx1 = G_approx1(tf.gather(x, cond_approx1_idxs), tf.gather(y, cond_approx1_idxs))
-    res_table_cond = _from_table(tf.gather(x, table_cond_idxs), tf.gather(y, table_cond_idxs))
-
-    res = tf.zeros([tf.shape(x)[0]], dtype=dtype)
-    res = tf.tensor_scatter_nd_update(res, tf.reshape(cond_approx1_idxs, (-1, 1)), res_approx1)
-    res = tf.tensor_scatter_nd_update(res, tf.reshape(table_cond_idxs, (-1, 1)), res_table_cond)
-    
-    return res
 
 def _func_G_table2(x, y, table: DiffractionTables):
-    r"""
-    Evaluate G using an analytical approximation near the origin and a table
-    elsewhere.
-
-    The small-argument region matches the existing non-table implementation.
-    Direct evaluation preserves the dependence on x/y near the origin, which
-    cannot be represented by bilinear interpolation in the first table cell.
-
-    Parameters
-    ----------
-    x, y : tf.Tensor, real, shape [N]
-        Nonnegative GFI arguments.
-    table : DiffractionTables
-        Lookup table and interpolation settings.
-
-    Returns
-    -------
-    tf.Tensor, complex, shape [N]
-        Approximated GFI values.
-
-    Notes
-    -----
-    The joint origin has direction-dependent limits and is not assigned a
-    unique physical value here.
-    """
-
+    """Evaluate GFI for flat, nonnegative arguments in three regions."""
     small = (x <= 0.4) & (y <= 0.4)
-    small_idx = tf.where(small)[:, 0]
-    regular_idx = tf.where(~small)[:, 0]
+    large = (x >= 3.0) | (y >= 3.0)
+    middle = ~(small | large)
 
-    x_small = tf.gather(x, small_idx)
-    y_small = tf.gather(y, small_idx)
-    small_values = _func_G_reg1(
-        tf.complex(x_small, tf.zeros_like(x_small)),
-        tf.complex(y_small, tf.zeros_like(y_small)),
-        x_small, y_small
+    def select(mask):
+        idx = tf.cast(tf.where(mask)[:, 0], tf.int32)
+        return idx, tf.gather(x, idx), tf.gather(y, idx)
+
+    i_small, xs, ys = select(small)
+    i_middle, xm, ym = select(middle) # bilinear interpolation
+    i_large, xl, yl = select(large)
+
+    g_small = _func_G_reg1(tf.complex(xs, tf.zeros_like(xs)),
+                           tf.complex(ys, tf.zeros_like(ys)), xs, ys)
+    g_middle = _func_G_table2_regular(xm, ym, table)
+    g_large = G_approx1(xl, yl)
+
+    return tf.dynamic_stitch(
+        [i_small, i_middle, i_large],
+        [tf.cast(g_small, table.dtype), g_middle, tf.cast(g_large, table.dtype)],
     )
-
-    regular_values = _func_G_table2_regular(
-        tf.gather(x, regular_idx), tf.gather(y, regular_idx), table
-    )
-
-    result = tf.zeros(tf.shape(x), dtype=table.dtype)
-    result = tf.tensor_scatter_nd_update(result, small_idx[:, None], tf.cast(small_values, table.dtype))
-    result = tf.tensor_scatter_nd_update(result, regular_idx[:, None], tf.cast(regular_values, table.dtype))
-    return result
 
 def _func_G_approximated_capolino2(x, y):
     # new and faster

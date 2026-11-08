@@ -10,11 +10,11 @@ from sionna.utils.tensors import expand_to_rank, insert_dims, flatten_dims,\
     split_dim
 from ..paths import Paths, PathsTmpData
 from ..utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
-    normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
-        compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
-            cot, cross, sign, rotation_matrix, acos_diff
+        normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
+        compute_field_unit_vectors, reflection_coefficient, slab_coefficients,\
+        cot, cross, sign, rotation_matrix, acos_diff, material_reflection_coefficients
 from sionna.rt.diffraction_funcs import calc_angles, calc_angles_concave, my_wd_compute_fields, transition_func,\
-        my_wd_compute_fields2, cot_transition_stable
+        my_wd_compute_fields2, cot_transition_stable, fresnel_integral_capolino
 
 if TYPE_CHECKING:
     from ..solver_base import SolverBase
@@ -28,38 +28,50 @@ class WedgeDiffraction:
         self._dtype = solver._dtype
         self._rdtype = solver._rdtype
 
-    def tracing(self, sources, targets, los_prim, diffraction, edge_diffraction, case='both') -> Tuple[Paths, PathsTmpData]:
+    def tracing(self, sources, targets, los_prim, diffraction, edge_diffraction, case='both', 
+                transmission=False) -> Tuple[Paths, PathsTmpData]:
         
         diff_paths = Paths(sources=sources, targets=targets, scene=self._scene,
                            types=Paths.DIFFRACTED)
         diff_paths_tmp = PathsTmpData(sources, targets, self._dtype)
+        diff_paths_tmp.junction_transmission = transmission
 
-        if (not diffraction) or (los_prim is None):
+        if not diffraction or (los_prim is None and not transmission):
             return diff_paths, diff_paths_tmp
-        
-        # Get the candidate wedges for diffraction
-        # Note: Only one-order diffraction is supported. Therefore, we
-        # restrict the candidate wedges to the ones of primitives in
-        # line-of-sight with the transmitter
-        # candidate_wedges : [num_candidate_wedges], int
-        #     Candidate wedges indices
-        diff_wedges_indices = self.solver._wedges_from_primitives(los_prim,
-                                                        edge_diffraction)
 
-        
-        ### 1)
-        # Discard paths for which at least one of the transmitter or
-        # receiver is inside the wedge.
-        # diff_wedges_indices : [num_targets, num_sources, max_num_paths]
-        # if not(case is None or case == 'None'):
-        #     diff_wedges_indices = self._discard_obstructing_wedges_and_corners(
-        #                                         diff_wedges_indices, targets,
-        #                                         sources, case)
+        if los_prim is None:
+            candidate_wedges = tf.zeros([0], tf.int32)
+        else:
+            candidate_wedges = self.solver._wedges_from_primitives(los_prim, edge_diffraction)
 
-        ### 2)
-        # Expand candidates to [num_targets, num_sources, num_candidate_wedges].
-        candidate_shape = tf.stack([tf.shape(targets)[0], tf.shape(sources)[0], tf.size(diff_wedges_indices)])
-        diff_wedges_indices = tf.broadcast_to(diff_wedges_indices[None, None, :], candidate_shape)
+        # Keep material junctions even if candidate rays missed their faces.
+        has_wedges = tf.shape(self.solver._wedges_objects)[0] > 0
+        if transmission and has_wedges:
+            array_size = tf.reduce_max(self.solver._primitives_2_objects) + 1
+            _, enabled = self.solver._build_slab_properties_tensors(array_size)
+
+            all_wedges = tf.range(tf.shape(self.solver._wedges_objects)[0], dtype=tf.int32)
+            face_enabled = tf.gather(enabled, self.solver._wedges_objects)
+            mixed = tf.math.logical_xor(face_enabled[:, 0], face_enabled[:, 1])
+            junctions = tf.boolean_mask(all_wedges, self._is_flat_shared_wedge(all_wedges) & mixed)
+            candidate_wedges, _ = tf.unique(tf.concat([candidate_wedges, junctions], axis=0))
+
+        candidate_shape = tf.stack([tf.shape(targets)[0], tf.shape(sources)[0], tf.size(candidate_wedges)])
+        diff_wedges_indices = tf.broadcast_to(candidate_wedges[None, None, :], candidate_shape)
+
+        if transmission and has_wedges:
+            origins = tf.gather(self.solver._wedges_origin, candidate_wedges)
+            normals = tf.gather(self.solver._wedges_normals[:, 0], candidate_wedges)
+            d_tx = dot(sources[:, None, :] - origins[None, :, :], normals[None, :, :])
+            d_rx = dot(targets[:, None, :] - origins[None, :, :], normals[None, :, :])
+            opposite = self._opposite_sides(d_tx[None, ...], d_rx[:, None, :])
+
+            flat_shared = self._is_flat_shared_wedge(candidate_wedges)
+            mixed = tf.gather(mixed, candidate_wedges)
+
+            # The transmitted sector currently requires exactly one transmissive face.
+            unsupported = opposite & (flat_shared & ~mixed)[None, None, :]
+            diff_wedges_indices = tf.where(unsupported, -1, diff_wedges_indices)
 
         # Compute the intersection points with the wedges, and discard paths
         # for which the intersection point is not on the finite wedge.
@@ -99,11 +111,14 @@ class WedgeDiffraction:
         if diff_wedges_indices.shape[2] == 0: # Number of diff. paths == 0
             return diff_paths, diff_paths_tmp
 
-        # Discard obstructed paths
-        diff_wedges_indices, diff_vertices =\
-            self._check_wedges_visibility(targets, sources,
-                                        diff_wedges_indices,
-                                        diff_vertices, case)
+        if getattr(diff_paths_tmp, "junction_transmission", False) and case == "both":
+            diff_wedges_indices = self.solver.solver_reflection._trace_diffraction_transmissions(
+                diff_wedges_indices, diff_vertices, sources, targets, diff_paths_tmp
+            )
+        else:
+            diff_wedges_indices, diff_vertices = self._check_wedges_visibility(
+                targets, sources, diff_wedges_indices, diff_vertices, case
+            )
 
         # diff_paths = Paths(sources=sources, targets=targets,
         #                 scene=self._scene, types=Paths.DIFFRACTED)
@@ -124,7 +139,18 @@ class WedgeDiffraction:
                                                     diff_paths_tmp, False)
         
         return diff_paths, diff_paths_tmp
-            
+
+    def _is_flat_shared_wedge(self, wedge_idxs):
+        """Identify shared edges whose two faces lie in the same plane."""
+        normals = tf.gather(self.solver._wedges_normals, wedge_idxs)
+        n0, nn = normals[..., 0, :], normals[..., 1, :]
+        parallel = tf.linalg.norm(cross(n0, nn), axis=-1) < 1e-6
+        return ~tf.gather(self.solver._is_edge, wedge_idxs) & parallel & (dot(n0, nn) > 0.0)
+
+    def _opposite_sides(self, d_tx, d_rx):
+        """Test whether endpoints are strictly on opposite sides of a plane."""
+        eps = self.solver.EPSILON
+        return ((d_tx > eps) & (d_rx < -eps)) | ((d_tx < -eps) & (d_rx > eps))
 
     def _discard_obstructing_wedges_and_corners(self, candidate_wedges, targets,
                                                 sources, case='both'):
@@ -540,6 +566,25 @@ class WedgeDiffraction:
         output_shape = tf.concat([shape, [2, 2]], axis=0)
         indices = tf.cast(tf.where(paths.mask & (paths.objects[0] >= 0)), tf.int32)
 
+        junction_indices = indices[:0]
+
+        if getattr(paths_tmp, "junction_transmission", False) and tf.shape(indices)[0] > 0:
+            wedge_idxs = tf.gather_nd(paths.objects[0], indices)
+            origins = tf.gather(self.solver._wedges_origin, wedge_idxs)
+            normals = tf.gather(self.solver._wedges_normals[:, 0], wedge_idxs)
+            sources = tf.gather(paths.sources, indices[:, 1])
+            targets = tf.gather(paths.targets, indices[:, 0])
+
+            d_tx = dot(sources - origins, normals)
+            d_rx = dot(targets - origins, normals)
+            face_objects = tf.gather(self.solver._wedges_objects, wedge_idxs)
+            enabled = tf.gather(self.solver._object_transmission_enabled, face_objects)
+            mixed = tf.math.logical_xor(enabled[:, 0], enabled[:, 1])
+
+            junction = self._is_flat_shared_wedge(wedge_idxs) & mixed & self._opposite_sides(d_tx, d_rx)
+            junction_indices = tf.boolean_mask(indices, junction)
+            indices = tf.boolean_mask(indices, ~junction)
+
         def compute_valid():
             # Each selected path produces exactly one matrix.
             wedge_idxs = tf.gather_nd(paths.objects[0], indices)
@@ -570,13 +615,82 @@ class WedgeDiffraction:
             matrices /= tf.cast(s_prime[:, None, None], self._dtype)
             return tf.scatter_nd(indices, matrices, output_shape)
 
-        return tf.cond(
+        matrices = tf.cond(
             tf.shape(indices)[0] > 0,
             compute_valid,
-            lambda: tf.zeros(output_shape, dtype=self._dtype)
+            lambda: tf.zeros(output_shape, dtype=self._dtype),
         )
 
+        if tf.shape(junction_indices)[0] > 0:
+            junction_matrices = self._flat_junction_transmission_matrices(
+                relative_permittivity, scattering_coefficient, paths, junction_indices
+            )
+            matrices += tf.scatter_nd(junction_indices, junction_matrices, output_shape)
 
+        return matrices
+
+    def _flat_junction_transmission_matrices(
+        self, relative_permittivity, scattering_coefficient, paths, indices
+    ):
+        """Evaluate a virtual metal knife edge with incident-side slab transmission."""
+        wedge_idxs = tf.gather_nd(paths.objects[0], indices)
+        points = tf.gather_nd(paths.vertices[0], indices)
+        sources = tf.gather(paths.sources, indices[:, 1])
+        targets = tf.gather(paths.targets, indices[:, 0])
+
+        s_prime_hat, s_prime = normalize(points - sources)
+        s_hat, s = normalize(targets - points)
+
+        face_objects = tf.gather(self.solver._wedges_objects, wedge_idxs)
+        face_enabled = tf.gather(self.solver._object_transmission_enabled, face_objects)
+        glass_face = tf.cast(~face_enabled[:, 0], tf.int32)
+        metal_face = 1 - glass_face
+
+        glass_objects = tf.gather(face_objects, glass_face, axis=1, batch_dims=1)
+        metal_objects = tf.gather(face_objects, metal_face, axis=1, batch_dims=1)
+
+        face_etas, face_scattering = self._wedge_materials(
+            relative_permittivity, scattering_coefficient, wedge_idxs, points
+        )
+        glass_eta = tf.gather(face_etas, glass_face, axis=1, batch_dims=1)
+        metal_eta = tf.gather(face_etas, metal_face, axis=1, batch_dims=1)
+        metal_scattering = tf.gather(face_scattering, metal_face, axis=1, batch_dims=1)
+
+        normal = tf.gather(self.solver._wedges_normals[:, 0], wedge_idxs)
+        e_hat = tf.gather(self.solver._wedges_e_hat, wedge_idxs)
+
+        # Point cross(normal, e_hat) into the metal half-plane.
+        e_hat = tf.where((metal_face == 0)[:, None], e_hat, -e_hat)
+
+        # Face 0 faces TX. Flipping both vectors preserves the metal half-plane.
+        from_back = dot(s_prime_hat, normal) > 0.0
+        normal = tf.where(from_back[:, None], -normal, normal)
+        e_hat = tf.where(from_back[:, None], -e_hat, e_hat)
+
+        # Both faces of the virtual wedge belong to the same metal sheet.
+        normals = tf.stack([normal, -normal], axis=1)
+        n = tf.fill(tf.shape(s_prime), tf.cast(2.0, self._rdtype))
+        etas = tf.stack([metal_eta, metal_eta], axis=1)
+        scattering = tf.stack([metal_scattering, metal_scattering], axis=1)
+        object_idxs = tf.stack([metal_objects, metal_objects], axis=1)
+
+        _, _, t_s, t_p = slab_coefficients(
+            glass_eta, tf.abs(dot(s_prime_hat, normal, clip=True)),
+            tf.gather(self.solver._object_thickness, glass_objects),
+            self._scene.wavelength, dtype=self._dtype,
+        )
+
+        matrices = self._wedge_field_matrices(
+            wedge_idxs, normals, e_hat, n, etas, scattering,
+            s_prime_hat, s_hat, s_prime, s,
+            tf.gather_nd(paths.theta_t, indices), tf.gather_nd(paths.phi_t, indices),
+            tf.gather_nd(paths.theta_r, indices), tf.gather_nd(paths.phi_r, indices),
+            object_idxs=object_idxs, incident_slab_coeffs=(t_s, t_p),
+        )
+
+        # Match the ordinary WD normalization in compute_fields().
+        return matrices / tf.cast(s_prime[:, None, None], self._dtype)
+    
     def _wedge_geometry(self, wedge_idxs):
         r"""
         Gather geometry without reversing wedge orientation.
@@ -641,9 +755,12 @@ class WedgeDiffraction:
         return etas, scattering
 
 
-    def _wedge_field_matrices(self, wedge_idxs, normals, e_hat, n, etas, scattering,
-                            s_prime_hat, s_hat, s_prime, s,
-                            theta_t, phi_t, theta_r, phi_r):
+    def _wedge_field_matrices(
+        self, wedge_idxs, normals, e_hat, n, etas, scattering,
+        s_prime_hat, s_hat, s_prime, s,
+        theta_t, phi_t, theta_r, phi_r,
+        object_idxs=None, incident_slab_coeffs=None,
+    ):
         r"""
         Compute flat ordinary-WD matrices using the existing field convention.
 
@@ -672,20 +789,6 @@ class WedgeDiffraction:
             Matrices including outgoing spreading and optional glass transmission.
             The caller must apply the incident factor 1/s_prime.
         """
-
-        # wavelength = self._scene.wavelength
-        # k = 2.0 * PI / wavelength
-        # n_0_hat, n_n_hat = normals[:, 0], normals[:, 1]
-
-        # phi_prime_hat, _ = normalize(cross(s_prime_hat, e_hat))
-        # beta_0_prime_hat = cross(phi_prime_hat, s_prime_hat)
-        # phi_hat_, _ = normalize(-cross(s_hat, e_hat))
-        # beta_0_hat = cross(phi_hat_, s_hat)
-
-        # phi_prime, phi, beta_prime, _ = calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat)
-        # phi_prime_c, phi_c, _, _ = calc_angles_concave(n_0_hat, e_hat, s_prime_hat, s_hat, n)
-        # phi_prime = tf.where(n < 1.0, phi_prime_c, phi_prime)
-        # phi = tf.where(n < 1.0, phi_c, phi)
 
         wavelength = self._scene.wavelength
         k = 2.0 * PI / wavelength
@@ -716,12 +819,29 @@ class WedgeDiffraction:
         phi_prime = tf.where(n < 1.0, phi_prime_c, phi_prime)
         phi = tf.where(n < 1.0, phi_c, phi)
 
-        def face_matrix(normal, eta, scattering_coef, cos_theta):
+        # WD sector selection preserves physical face ordering.
+        if object_idxs is None:
+            object_idxs = tf.gather(self.solver._wedges_objects, wedge_idxs)
+
+        face_thickness = tf.gather(self.solver._object_thickness, object_idxs)
+        face_slab_enabled = tf.gather(self.solver._object_transmission_enabled, object_idxs)
+        # object_idxs = tf.gather(self.solver._wedges_objects, wedge_idxs)
+        # face_thickness = tf.gather(self.solver._object_thickness, object_idxs)
+        # face_slab_enabled = tf.gather(self.solver._object_transmission_enabled, object_idxs)
+
+        cos_theta_0 = tf.abs(dot(s_prime_hat, n_0_hat, clip=True))
+        cos_theta_n = tf.abs(dot(s_prime_hat, n_n_hat, clip=True))
+        face_cos_theta = tf.stack([cos_theta_0, cos_theta_n], axis=-1)
+
+        face_r_s, face_r_p = material_reflection_coefficients(
+            etas, face_cos_theta, face_thickness, face_slab_enabled, wavelength
+        )
+
+        def face_matrix(normal, r_s, r_p, scattering_coef):
             """Express one face reflection operator in the diffraction bases."""
             e_i_s, e_i_p, e_r_s, e_r_p = compute_field_unit_vectors(
                 s_prime_hat, s_hat, normal, self.solver.EPSILON
             )
-            r_s, r_p = reflection_coefficient(eta, cos_theta)
             reduction = tf.cast(tf.sqrt(1.0 - scattering_coef**2), self._dtype)
             reflection = tf.stack([r_s * reduction, r_p * reduction], axis=-1)
 
@@ -734,15 +854,11 @@ class WedgeDiffraction:
             matrix = -tf.matmul(mat_out, reflection[:, :, None] * mat_in)
             return matrix, e_i_s, e_i_p
 
-        # Use the full 3D incidence angle, consistent with specular reflection.
-        cos_theta_0 = tf.abs(dot(s_prime_hat, n_0_hat, clip=True))
-        cos_theta_n = tf.abs(dot(s_prime_hat, n_n_hat, clip=True))
-
         r_0, e_i_s_0, e_i_p_0 = face_matrix(
-            n_0_hat, etas[:, 0], scattering[:, 0], cos_theta_0
+            n_0_hat, face_r_s[:, 0], face_r_p[:, 0], scattering[:, 0]
         )
         r_n, _, _ = face_matrix(
-            n_n_hat, etas[:, 1], scattering[:, 1], cos_theta_n
+            n_n_hat, face_r_s[:, 1], face_r_p[:, 1], scattering[:, 1]
         )
 
         phi_m, phi_p = phi - phi_prime, phi + phi_prime
@@ -766,13 +882,29 @@ class WedgeDiffraction:
         matrices *= -tf.cast(spreading[:, None, None], self._dtype)
 
         obj_geom = self.solver.obj_geom
-        if obj_geom is not None and obj_geom.is_glass_transmission:
+
+        if incident_slab_coeffs is not None:
+            t_s, t_p = incident_slab_coeffs
+
+            # The glass and metal are coplanar, so face 0 supplies the slab TE/TM basis.
+            mat_to_sp = tf.cast(component_transform(
+                phi_prime_hat, beta_0_prime_hat, e_i_s_0, e_i_p_0
+            ), self._dtype)
+            mat_from_sp = tf.cast(component_transform(
+                e_i_s_0, e_i_p_0, phi_prime_hat, beta_0_prime_hat
+            ), self._dtype)
+
+            transmission = tf.stack([t_s, t_p], axis=-1)
+            glass = tf.matmul(mat_from_sp, transmission[..., None] * mat_to_sp)
+            matrices = tf.matmul(matrices, glass)
+
+        elif obj_geom is not None and obj_geom.is_glass_transmission:
             glass = obj_geom.diffraction_glass_transmission(
                 valid_wedges_idx=wedge_idxs, n=n, mask=tf.ones_like(n, dtype=tf.bool),
                 phi_prime_hat=phi_prime_hat, beta_0_prime_hat=beta_0_prime_hat,
                 e_i_s_0=e_i_s_0, e_i_p_0=e_i_p_0,
                 s_prime_hat=s_prime_hat, n_0_hat=n_0_hat,
-                wavelength=wavelength, dtype=self._dtype
+                wavelength=wavelength, dtype=self._dtype,
             )
             if obj_geom.los_transmissions == "two":
                 glass = tf.matmul(glass, glass)
@@ -791,7 +923,7 @@ class WedgeDiffraction:
         return tf.matmul(mat_to_gcs, tf.matmul(matrices, mat_from_gcs))
 
     def simple_compute_fields(self, wedge_idxs, s_wedge_prime_hat, s_wedge_hat, s_wedge_prime, s_wedge, mask,
-                                ell_ = None, skip_F=False):
+                                ell_ = None, skip_F=False, geometry_override=None):
         # # [num_targets, num_sources, max_num_paths]
         valid_wedges_idx = tf.where(wedge_idxs == -1, 0, wedge_idxs)
 
@@ -815,6 +947,12 @@ class WedgeDiffraction:
         n_0_hat = normals[...,0,:]
         # [num_targets, num_sources, max_num_paths, 3]
         n_n_hat = normals[...,1,:]
+
+        if geometry_override is not None:
+            new_normal, new_tangent, new_n, use_override = geometry_override
+            n_0_hat = tf.where(use_override[:, None], new_normal, n_0_hat)
+            e_hat = tf.where(use_override[:, None], new_tangent, e_hat)
+            n = tf.where(use_override, new_n, n)
 
         w_phi_prime, w_phi, w_beta_prime, _ = calc_angles(n_0_hat, e_hat, s_wedge_prime_hat, s_wedge_hat)
 

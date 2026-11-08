@@ -420,7 +420,7 @@ class Scene:
                     los=True, reflection=True, diffraction=False, refl_diff=False,
                     scattering=False, scat_keep_prob=0.001, scat_sparsity_coef=1,
                     edge_diffraction=False, vertex_diffraction=False, double_diffraction=False,
-                    check_scene=True):
+                    transmission=False, check_scene=True):
         # pylint: disable=line-too-long
         r"""
         Computes the trajectories of the paths by shooting rays
@@ -498,6 +498,11 @@ class Scene:
             connect two primitives, is considered.
             Defaults to `False`.
 
+        transmission : bool
+            Allow direct TX-RX paths to cross transmission-enabled surfaces.
+            Currently supported only for direct paths. Requires los=True.
+            Defaults to False.
+
         check_scene : bool
             If set to `True`, checks that the scene is well configured before
             computing the paths. This can add a significant overhead.
@@ -547,14 +552,15 @@ class Scene:
                                                scat_sparsity_coef=scat_sparsity_coef,
                                                edge_diffraction=edge_diffraction,
                                                vertex_diffraction=vertex_diffraction,
-                                               double_diffraction=double_diffraction)
+                                               double_diffraction=double_diffraction,
+                                               transmission=transmission)
 
         return paths
 
     def compute_fields(self, spec_paths, diff_paths, mixed_paths, scat_paths,
                        spec_paths_tmp, diff_paths_tmp, mixed_paths_tmp, scat_paths_tmp,
                        vertex_diff_paths, vertex_diff_paths_tmp, vd_refl_paths, vd_refl_paths_tmp,
-                       dd_paths, dd_paths_tmp, ddd_paths, ddd_paths_tmp,
+                       dd_paths, dd_paths_tmp, ddd_paths, ddd_paths_tmp, transmission=False,
                        check_scene=True, scat_random_phases=True,
                        testing=False):
         r"""compute_fields(self, spec_paths, diff_paths, scat_paths, spec_paths_tmp, diff_paths_tmp, scat_paths_tmp, check_scene=True, scat_random_phases=True)
@@ -602,6 +608,11 @@ class Scene:
             Additional data required to compute the EM fields of the scattered
             paths
 
+        transmission : bool
+            Allow direct TX-RX paths to cross transmission-enabled surfaces.
+            Currently supported only for direct paths. Requires los=True.
+            Defaults to False.
+
         check_scene : bool
             If set to `True`, checks that the scene is well configured before
             computing the paths. This can add a significant overhead.
@@ -626,7 +637,7 @@ class Scene:
         output = self._solver_paths.compute_fields(spec_paths, diff_paths, mixed_paths,
             scat_paths, spec_paths_tmp, diff_paths_tmp, mixed_paths_tmp, scat_paths_tmp,
             vertex_diff_paths, vertex_diff_paths_tmp, vd_refl_paths, vd_refl_paths_tmp,
-            dd_paths, dd_paths_tmp, ddd_paths, ddd_paths_tmp,
+            dd_paths, dd_paths_tmp, ddd_paths, ddd_paths_tmp, transmission,
             scat_random_phases, testing)
         sources, targets, paths_as_dict = output[:3]
         paths = Paths(sources, targets, self)
@@ -656,7 +667,7 @@ class Scene:
                       diffraction=False, refl_diff=False, scattering=False, scat_keep_prob=0.001,
                       scat_sparsity_coef=1,
                       vertex_diffraction=False, double_diffraction=False,
-                      edge_diffraction=False, check_scene=True,
+                      edge_diffraction=False, transmission=False, check_scene=True,
                       scat_random_phases=True, testing=False) -> Paths:
         # pylint: disable=line-too-long
         r"""
@@ -833,7 +844,7 @@ class Scene:
         # Trace the paths
         traced_paths = self.trace_paths(max_depth, method, num_samples, los,
             reflection, diffraction, refl_diff, scattering, scat_keep_prob, scat_sparsity_coef,
-            edge_diffraction, vertex_diffraction, double_diffraction, check_scene)
+            edge_diffraction, vertex_diffraction, double_diffraction, transmission, check_scene)
 
         # Compute the fields and merge the paths
         # Check scene is not done twice

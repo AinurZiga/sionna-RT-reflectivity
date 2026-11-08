@@ -17,7 +17,7 @@ from .utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
         compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
             cot, cross, sign, rotation_matrix, acos_diff, rot_mat_from_unit_vecs, \
-            r_hat
+            r_hat, slab_coefficients
 
 if TYPE_CHECKING:
     from .solver_paths import SolverPaths
@@ -626,105 +626,9 @@ def slab_transmission_coefficient(
         Relative TM transmission coefficient.
     """
 
-    real_dtype = dtype.real_dtype
-
-    eta = tf.cast(eta, dtype)
-    thickness = tf.cast(thickness, real_dtype)
-    wavelength = tf.cast(wavelength, real_dtype)
-
-    cos_theta_i = tf.cast(cos_theta_i, real_dtype)
-    cos_theta_i = tf.clip_by_value(
-        cos_theta_i,
-        tf.cast(0.0, real_dtype),
-        tf.cast(1.0, real_dtype)
+    _, _, t_s, t_p = slab_coefficients(
+        eta, cos_theta_i, thickness, wavelength, dtype=dtype
     )
-
-    # Avoid divisions by zero at exactly grazing incidence
-    eps = tf.cast(1e-7, real_dtype)
-    cos_theta_i_safe = tf.maximum(cos_theta_i, eps)
-
-    sin_theta_i_sq = tf.maximum(
-        tf.cast(0.0, real_dtype),
-        tf.cast(1.0, real_dtype) - cos_theta_i**2
-    )
-
-    k0 = tf.cast(2.0 * PI, real_dtype) / wavelength
-
-    # Normalized longitudinal wavenumbers:
-    # q_1 = k_z1 / k0 in air
-    # q_2 = k_z2 / k0 in the slab
-    q_1 = tf.cast(cos_theta_i_safe, dtype)
-    q_2 = tf.sqrt(
-        eta - tf.cast(sin_theta_i_sq, dtype)
-    )
-
-    # Select the passive branch for the exp(-j*k_z*z) convention.
-    # A lossy medium must have Im(q_2) <= 0.
-    q_2 = tf.where(
-        tf.math.imag(q_2) > 0.0,
-        -q_2,
-        q_2
-    )
-
-    # Normalized wave admittances.
-    #
-    # TE:
-    #   Y_s proportional to k_z
-    #
-    # TM:
-    #   Y_p proportional to epsilon / k_z
-    y_1_s = q_1
-    y_2_s = q_2
-
-    y_1_p = tf.math.reciprocal(q_1)
-    y_2_p = eta / q_2
-
-    def _slab_coefficient(y_1, y_2):
-        """Compute the slab coefficient for one polarization."""
-
-        # Transmission through the first interface
-        t_12 = 2.0 * y_1 / (y_1 + y_2)
-
-        # Transmission through the second interface
-        t_23 = 2.0 * y_2 / (y_2 + y_1)
-
-        # Internal reflection coefficients
-        r_21 = (y_2 - y_1) / (y_2 + y_1)
-        r_23 = r_21
-
-        # Propagation through the slab along its normal coordinate
-        propagation = tf.exp(
-            -1j
-            * tf.cast(k0 * thickness, dtype)
-            * q_2
-        )
-
-        # Absolute transmission between the two slab interfaces
-        t_abs = (
-            t_12
-            * t_23
-            * propagation
-            / (
-                1.0
-                - r_21
-                * r_23
-                * propagation**2
-            )
-        )
-
-        # Remove the phase that the RT solver already assigns to the
-        # corresponding air-filled region between the same planes
-        air_normalization = tf.exp(
-            1j
-            * tf.cast(k0 * thickness, dtype)
-            * q_1
-        )
-
-        return t_abs * air_normalization
-
-    t_s = _slab_coefficient(y_1_s, y_2_s)
-    t_p = _slab_coefficient(y_1_p, y_2_p)
-
     return t_s, t_p
 ####
     

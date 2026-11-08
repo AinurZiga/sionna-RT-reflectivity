@@ -516,6 +516,96 @@ def reflection_coefficient(eta, cos_theta):
     r_tm = tf.math.divide_no_nan(c-d, c+d)
     return r_te, r_tm
 
+def slab_coefficients(eta, cos_theta_i, thickness, wavelength, dtype=tf.complex64):
+    r"""Compute reflection and transmission of an air-material-air slab.
+
+    Parameters
+    ----------
+    eta : tf.Tensor, complex
+        Relative permittivity with the passive convention Im(eta) <= 0.
+    cos_theta_i : tf.Tensor, real
+        Cosine of the incidence angle in air.
+    thickness : tf.Tensor, real
+        Thickness along the surface normal [m].
+    wavelength : tf.Tensor, real
+        Free-space wavelength [m].
+    dtype : tf.DType
+        Complex computation dtype.
+
+    Returns
+    -------
+    r_s, r_p : tf.Tensor, complex
+        Slab reflection coefficients in the same polarization convention
+        as reflection_coefficient().
+    t_s, t_p : tf.Tensor, complex
+        Slab transmission coefficients relative to propagation through air
+        between the same reference planes.
+
+    Notes
+    -----
+    Inputs must be broadcast-compatible. Internal reflections are included.
+    At zero thickness, reflection is zero and transmission is one.
+    """
+    dtype = tf.as_dtype(dtype)
+    rdtype = dtype.real_dtype
+
+    eta = tf.cast(eta, dtype)
+    thickness = tf.cast(thickness, rdtype)
+    wavelength = tf.cast(wavelength, rdtype)
+    cos_theta_i = tf.cast(cos_theta_i, rdtype)
+
+    # Preserve the grazing-incidence guard used by the existing slab model.
+    c = tf.clip_by_value(cos_theta_i, tf.cast(1e-7, rdtype), tf.cast(1.0, rdtype))
+    c = tf.cast(c, dtype)
+    q = tf.sqrt(eta - 1.0 + c**2)
+
+    # Select the passive branch for exp(-j*k*z).
+    q = tf.where(tf.math.imag(q) > 0.0, -q, q)
+
+    kd = tf.cast(2.0 * PI * thickness / wavelength, dtype)
+    round_trip_minus_one = tf.math.expm1(-2j * kd * q)
+    relative_propagation = tf.exp(-1j * kd * (q - c))
+
+    def coefficients(a, b):
+        """Evaluate one polarization without subtracting nearly equal phases."""
+        interface_r = (a - b) / (a + b)
+
+        # Evaluate 1 - interface_r**2 without cancellation near |r| = 1.
+        interface_t_product = 4.0 * a * b / (a + b)**2
+        denominator = interface_t_product - interface_r**2 * round_trip_minus_one
+
+        slab_r = -interface_r * round_trip_minus_one / denominator
+        slab_t = interface_t_product * relative_propagation / denominator
+        return slab_r, slab_t
+
+    r_s, t_s = coefficients(c, q)
+    r_p, t_p = coefficients(eta * c, q)
+    return r_s, r_p, t_s, t_p
+
+def material_reflection_coefficients(eta, cos_theta_i, thickness,
+                                     transmission_enabled, wavelength):
+    """Select half-space or finite-slab reflection coefficients.
+
+    All inputs must have the same non-scalar batch shape.
+    The complex computation dtype is taken from eta.
+    """
+    r_s, r_p = reflection_coefficient(eta, cos_theta_i)
+    indices = tf.where(transmission_enabled)
+
+    # Evaluate slab coefficients only where explicitly enabled.
+    if tf.shape(indices)[0] > 0:
+        slab_r_s, slab_r_p, _, _ = slab_coefficients(
+            eta=tf.gather_nd(eta, indices),
+            cos_theta_i=tf.gather_nd(cos_theta_i, indices),
+            thickness=tf.gather_nd(thickness, indices),
+            wavelength=wavelength,
+            dtype=eta.dtype,
+        )
+        r_s = tf.tensor_scatter_nd_update(r_s, indices, slab_r_s)
+        r_p = tf.tensor_scatter_nd_update(r_p, indices, slab_r_p)
+
+    return r_s, r_p
+
 def paths_to_segments(paths):
     """
     Extract the segments corresponding to a set of ``paths``

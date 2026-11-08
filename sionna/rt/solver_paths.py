@@ -181,7 +181,7 @@ class SolverPaths(SolverBase):
 
     def trace_paths(self, max_depth, method, num_samples, los, reflection, diffraction,
                  refl_diff, scattering, scat_keep_prob, scat_sparsity_coef, edge_diffraction, vertex_diffraction, 
-                 double_diffraction):
+                 double_diffraction, transmission):
         # pylint: disable=line-too-long
         r"""
         Traces the paths.
@@ -418,23 +418,38 @@ class SolverPaths(SolverBase):
         mirrored_vertices, tri_p0, normals = self.solver_reflection.get_images(sources, candidates)
 
         spec_paths, spec_paths_tmp = self.solver_reflection.tracing(sources,\
-            targets, los, reflection, candidates, mirrored_vertices, tri_p0, normals)
+            targets, los, reflection, candidates, mirrored_vertices, tri_p0, normals, transmission)
 
         spec_paths.my_types = Paths.SPECULAR * tf.ones_like(spec_paths.objects, tf.int32)
 
         spec_paths.true_objects = spec_paths.objects
 
         # [num_targets, num_sources]
+        # A transmitted direct path is not an unobstructed LOS link.
         if los and tf.shape(spec_paths.mask)[2] > 0:
-            self.is_los = spec_paths.mask[..., :1]
+            direct = tf.reduce_all(spec_paths.objects == -1, axis=0) & spec_paths.mask
+            crossed = tf.scatter_nd(
+                spec_paths_tmp.transmission_path_indices,
+                tf.ones_like(spec_paths_tmp.transmission_primitives, dtype=tf.int32),
+                tf.shape(spec_paths.mask),
+            ) > 0
+            self.is_los = tf.reduce_any(direct & ~crossed, axis=-1, keepdims=True)
         else:
-            self.is_los = tf.zeros((targets.shape[0], sources.shape[0], 1), dtype=tf.bool)
+            self.is_los = tf.zeros(
+                [tf.shape(targets)[0], tf.shape(sources)[0], 1], dtype=tf.bool
+            )
+
+        # if los and tf.shape(spec_paths.mask)[2] > 0:
+        #     self.is_los = spec_paths.mask[..., :1]
+        # else:
+        #     self.is_los = tf.zeros((targets.shape[0], sources.shape[0], 1), dtype=tf.bool)
 
         ############################################
         # Diffracted paths
         ############################################
-        diff_paths, diff_paths_tmp = self.solver_wedge_diffraction.tracing(sources,targets, \
-                                        los_prim, diffraction, edge_diffraction)
+        diff_paths, diff_paths_tmp = self.solver_wedge_diffraction.tracing(
+            sources, targets, los_prim, diffraction, edge_diffraction, transmission=transmission,
+        )
         
         diff_paths, diff_paths_tmp = self.solver_wedge_diffraction.check_obstructions( \
                 diff_paths, diff_paths_tmp, diffraction)
@@ -453,7 +468,9 @@ class SolverPaths(SolverBase):
         vertex_diff_paths_tmp = PathsTmpData(sources, targets, self._dtype)
 
         if vertex_diffraction:
-            vertex_diff_paths, vertex_diff_paths_tmp = self.vertex_diffraction.tracing(sources, targets, edge_diffraction=edge_diffraction)
+            vertex_diff_paths, vertex_diff_paths_tmp = self.vertex_diffraction.tracing(sources, targets, 
+                                                     edge_diffraction=edge_diffraction, transmission=transmission)
+            vertex_diff_paths_tmp.junction_transmission = transmission
 
             vertex_diff_paths.my_types = Paths.VERTEX_DIFFRACTED * tf.ones_like(vertex_diff_paths.objects, tf.int32)
 
@@ -558,12 +575,24 @@ class SolverPaths(SolverBase):
         dd_paths = Paths(sources=sources, targets=targets, scene=self._scene, types=Paths.DOUBLE_DIFF)
         dd_paths_tmp = PathsTmpData(sources, targets, self._dtype)
 
+        junction_enabled = None
+        if transmission and double_diffraction and tf.size(self._primitives_2_objects) > 0:
+            array_size = tf.reduce_max(self._primitives_2_objects) + 1
+            _, junction_enabled = self._build_slab_properties_tensors(array_size)
+
         if (los_prim is not None) and double_diffraction:
             ###### 1)
             if self.double_diffraction.is_wedge_wedge or self.double_diffraction.is_wedge_vertex or \
                     self.double_diffraction.is_vertex_wedge or self.double_diffraction.is_vertex_vertex:
                 wedges_1 = self._wedges_from_primitives(los_prim, True)
                 wedges_2 = self._wedges_from_primitives(los_prim_t, True)
+                if junction_enabled is not None:
+                    all_wedges = tf.range(tf.shape(self._wedges_objects)[0], dtype=tf.int32)
+                    junctions = tf.boolean_mask(
+                        all_wedges, self.double_diffraction._junction_candidates(all_wedges, junction_enabled)
+                    )
+                    wedges_1, _ = tf.unique(tf.concat([wedges_1, junctions], axis=0))
+                    wedges_2, _ = tf.unique(tf.concat([wedges_2, junctions], axis=0))
                 dd_pairs = tf.zeros((2, tf.shape(wedges_1)[0], tf.shape(wedges_2)[0]), tf.int32)
                 b1 = tf.repeat(wedges_1[..., None], tf.shape(wedges_2)[0], axis=1)
                 b2 = tf.repeat(wedges_2[None, ...], tf.shape(wedges_1)[0], axis=0)
@@ -581,7 +610,7 @@ class SolverPaths(SolverBase):
                 dd_pairs = tf.boolean_mask(dd_pairs, non_duplicates_mask, axis=0)
 
                 ### preliminary visibility
-                dd_pairs = self.double_diffraction.check_preliminary_visibility(dd_pairs)
+                dd_pairs = self.double_diffraction.check_preliminary_visibility(dd_pairs, junction_enabled=junction_enabled)
 
                 ## Check if coplanar edges
                 if self.double_diffraction.is_only_coplanar:
@@ -618,7 +647,7 @@ class SolverPaths(SolverBase):
             if self.double_diffraction.is_wedge_wedge:
                 ## Discard obstructed by wedges
                 # [num_sources, num_targets, num_pairs, 2]
-                dd_pair_idxs, active = self.double_diffraction.discard_obstructing(dd_pairs, sources, targets)
+                dd_pair_idxs, active = self.double_diffraction.discard_obstructing(dd_pairs, sources, targets, junction_enabled=junction_enabled)
                 
                 if tf.shape(dd_pair_idxs)[2] != 0:
                     # Find diffraction points
@@ -640,7 +669,7 @@ class SolverPaths(SolverBase):
                     active = tf.logical_and(active, valid)
 
                     # Discard obstructed paths
-                    valid = self.double_diffraction._check_visibility(sources, targets, diff_points, dd_pair_idxs)
+                    valid = self.double_diffraction._check_visibility(sources, targets, diff_points, dd_pair_idxs, junction_enabled=junction_enabled)
                     active = tf.logical_and(active, valid)
 
                     dd_paths.objects = tf.transpose(dd_pair_idxs, perm=[3, 1, 0, 2])
@@ -720,7 +749,7 @@ class SolverPaths(SolverBase):
 
                 # [num_sources, num_targets, num_pairs, 2]
                 dd_wv_idxs, active =\
-                        self.double_diffraction.discard_obstructing_dd_wedge_vertex(dd_wedge_vertex, sources, targets)
+                        self.double_diffraction.discard_obstructing_dd_wedge_vertex(dd_wedge_vertex, sources, targets, junction_enabled=junction_enabled)
                 
                 if self.double_diffraction.is_only_in_nlos:
                     # set to False all paths in LOS
@@ -735,7 +764,7 @@ class SolverPaths(SolverBase):
                 active = tf.logical_and(active, valid2)
 
                 # Discard obstructed paths
-                valid2 = self.double_diffraction.check_visibility_mixed(sources, targets, diff_points2, dd_wv_idxs[..., 0], dd_wv_idxs[..., 1])
+                valid2 = self.double_diffraction.check_visibility_mixed(sources, targets, diff_points2, dd_wv_idxs[..., 0], dd_wv_idxs[..., 1], junction_enabled=junction_enabled)
                 active = tf.logical_and(active, valid2)
 
                 ###
@@ -752,7 +781,7 @@ class SolverPaths(SolverBase):
                     dd_paths_wv.mask = tf.transpose(active, perm=[1, 0, 2])
 
                     dd_paths_wv = self.double_diffraction._gather_valid_paths(dd_paths_wv)
-                    dd_paths_wv.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_wv, vertex_depth=1)
+                    dd_paths_wv.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_wv, vertex_depth=1, junction_enabled=junction_enabled)
                     dd_paths_wv.dd_type = 1 * tf.ones(dd_paths_wv.mask.shape, dtype=tf.int32)  # 1: wedge-vertex
                     dd_paths_wv.my_types = tf.stack([Paths.DIFFRACTED * tf.ones_like(dd_paths_wv.mask, tf.int32), 
                                                      Paths.VERTEX_DIFFRACTED * tf.ones_like(dd_paths_wv.mask, tf.int32)], 
@@ -776,7 +805,7 @@ class SolverPaths(SolverBase):
 
                 # [num_sources, num_targets, num_pairs, 2]
                 dd_vw_idxs, active =\
-                        self.double_diffraction.discard_obstructing_dd_vertex_wedge(vw_pairs, sources, targets)
+                        self.double_diffraction.discard_obstructing_dd_vertex_wedge(vw_pairs, sources, targets, junction_enabled=junction_enabled)
 
                 if self.double_diffraction.is_only_in_nlos:
                     # set to False all paths in LOS
@@ -791,7 +820,13 @@ class SolverPaths(SolverBase):
                 active = tf.logical_and(active, valid3)
 
                 # Discard obstructed paths
-                valid3 = self.double_diffraction.check_visibility_mixed(targets, sources, diff_points3[::-1], dd_vw_idxs[..., 1], dd_vw_idxs[..., 0])
+                # Reverse interaction order and swap link axes for the EV visibility check.
+                reverse_points = tf.transpose(diff_points3[::-1], [0, 2, 1, 3, 4])
+                reverse_pairs = tf.transpose(dd_vw_idxs, [1, 0, 2, 3])
+                valid3 = self.double_diffraction.check_visibility_mixed(
+                    targets, sources, reverse_points, reverse_pairs[..., 1], reverse_pairs[..., 0],
+                    junction_enabled=junction_enabled,
+                )
                 valid3 = tf.transpose(valid3, perm=[1, 0, 2])  
                 active = tf.logical_and(active, valid3)
 
@@ -808,7 +843,7 @@ class SolverPaths(SolverBase):
                     dd_paths_vw.mask = tf.transpose(active, perm=[1, 0, 2])
 
                     dd_paths_vw = self.double_diffraction._gather_valid_paths(dd_paths_vw)
-                    dd_paths_vw.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_vw, vertex_depth=0)
+                    dd_paths_vw.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_vw, vertex_depth=0, junction_enabled=junction_enabled)
                     
                     dd_paths_vw.dd_type = 2 * tf.ones(dd_paths_vw.mask.shape, dtype=tf.int32)  # 2: vertex-wedge
                     dd_paths_vw.my_types = tf.stack([Paths.VERTEX_DIFFRACTED * tf.ones_like(dd_paths_vw.mask, tf.int32), 
@@ -970,6 +1005,7 @@ class SolverPaths(SolverBase):
         vertex_diff_paths_tmp.scat_keep_prob = tf.cast(scat_keep_prob, self._rdtype)
         vd_refl_paths_tmp.num_samples = num_samples
         vd_refl_paths_tmp.scat_keep_prob = tf.cast(scat_keep_prob, self._rdtype)
+        dd_paths_tmp.junction_transmission = transmission
         dd_paths_tmp.num_samples = num_samples
         dd_paths_tmp.scat_keep_prob = tf.cast(scat_keep_prob, self._rdtype)
 
@@ -980,8 +1016,8 @@ class SolverPaths(SolverBase):
     def compute_fields(self, spec_paths, diff_paths, mixed_paths, mixed_paths_tmp, 
         scat_paths, spec_paths_tmp,
         diff_paths_tmp, scat_paths_tmp, vertex_diff_paths, 
-        vertex_diff_paths_tmp, vd_refl_paths, vd_refl_paths_tmp,\
-              dd_paths, dd_paths_tmp, ddd_paths, ddd_paths_tmp, scat_random_phases, testing):
+        vertex_diff_paths_tmp, vd_refl_paths, vd_refl_paths_tmp,
+        dd_paths, dd_paths_tmp, ddd_paths, ddd_paths_tmp, transmission, scat_random_phases, testing):
         r"""
         Computes the EM fields for a set of traced paths.
 
@@ -1086,7 +1122,13 @@ class SolverPaths(SolverBase):
         velocity = object_properties[6]
         self.rot_motion_point_on_axis = object_properties[7]
         self.rot_motion_axis = object_properties[8]
-        self.rot_motion_angular_velocity  = object_properties[9]
+        self.rot_motion_angular_velocity = object_properties[9]
+
+        thickness, transmission_enabled = self._build_slab_properties_tensors(tf.shape(velocity)[0])
+
+        # Rebuild inside each field evaluation to preserve material gradients.
+        self._object_thickness = thickness
+        self._object_transmission_enabled = transmission_enabled
 
         ##############################################
         # LoS and Specular paths
@@ -1094,8 +1136,14 @@ class SolverPaths(SolverBase):
 
         if spec_paths.objects.shape[3] > 0:
             # Compute the EM transition matrices and Doppler shifts
-            spec_mat_t = self.solver_reflection._spec_transition_matrices(etas, 
-                                scattering_coefficient, spec_paths, spec_paths_tmp, False)
+            spec_mat_t = self.solver_reflection._spec_transition_matrices(
+                etas, scattering_coefficient, spec_paths, spec_paths_tmp, False,
+                thickness, transmission_enabled
+            )
+
+            spec_mat_t = self.solver_reflection._apply_direct_transmission(
+                spec_paths, spec_paths_tmp, spec_mat_t, etas, thickness
+            )
             
             spec_paths.doppler = self._compute_doppler_shifts(spec_paths,
                                                               spec_paths_tmp,
@@ -1125,6 +1173,10 @@ class SolverPaths(SolverBase):
             diff_mat_t = self.solver_wedge_diffraction.compute_fields(
                 etas, scattering_coefficient, diff_paths, diff_paths_tmp
             )
+
+            diff_mat_t = self.solver_reflection._apply_diffraction_transmission(
+                diff_paths, diff_paths_tmp, diff_mat_t, etas, thickness
+            )            
             
             diff_paths.doppler = self._compute_doppler_shifts(diff_paths,
                                                               diff_paths_tmp,
@@ -1152,6 +1204,10 @@ class SolverPaths(SolverBase):
             vertex_diff_mat_t =\
                 self.vertex_diffraction.compute_fields2(etas,
                             scattering_coefficient, vertex_diff_paths, vertex_diff_paths_tmp)
+
+            vertex_diff_mat_t = self.solver_reflection._apply_diffraction_transmission(
+                vertex_diff_paths, vertex_diff_paths_tmp, vertex_diff_mat_t, etas, thickness
+            )                            
             
             vertex_diff_paths.doppler = self._compute_doppler_shifts(vertex_diff_paths,
                                                                 vertex_diff_paths_tmp,
