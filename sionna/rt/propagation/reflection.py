@@ -99,6 +99,7 @@ class Reflection:
         spec_paths = Paths(sources=sources, targets=targets, scene=self._scene,
                            types=Paths.SPECULAR)
         spec_paths_tmp = PathsTmpData(sources, targets, self._dtype)
+        spec_paths_tmp.reflection_traced = reflection
 
         if los or reflection:
             # Using the image method, computes the non-obstructed specular paths
@@ -996,8 +997,9 @@ class Reflection:
             valid_normals = valid_normals[:max_depth]
             # [max_depth, num_targets, num_sources, max_num_paths]
             valid_objects = valid_objects[:max_depth]
+            valid_primitives = valid_primitives[:max_depth]
 
-        return mask, valid_vertices, valid_objects, valid_normals
+        return mask, valid_vertices, valid_objects, valid_normals, valid_primitives
     
 
     def _spec_image_method(self, candidates, paths, spec_paths_tmp, mirrored_vertices, tri_p0, normals, transmission=False):
@@ -1196,7 +1198,7 @@ class Reflection:
         # valid_normals : [max_depth, num_targets, num_sources,
         #                   max_num_paths, 3], tf.float
         #     Normals to the primitives at the intersection points.
-        mask, valid_vertices, valid_objects, valid_normals =\
+        mask, valid_vertices, valid_objects, valid_normals, valid_primitives =\
             self._spec_image_method_phase_3(candidates, valid, num_targets,
                                 num_sources, path_vertices, path_normals, blk)
 
@@ -1209,6 +1211,7 @@ class Reflection:
         #paths.depth_mask = valid_objects != -1
 
         spec_paths_tmp.normals = valid_normals
+        spec_paths_tmp.reflection_primitives = valid_primitives
 
     ### For combinations (reflection+diffraction)
 

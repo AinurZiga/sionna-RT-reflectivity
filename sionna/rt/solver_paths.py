@@ -338,12 +338,67 @@ class SolverPaths(SolverBase):
             candidates_t = candidates
             _candidates = candidates
 
-        elif method == 'env_driven':
-            obj_primitive_idxs = self.obj_geom.primitive_idxs
-            visible = self._my_list_candidates_env_depth_1(sources, obj_primitive_idxs) # [num_tx, num_obj_primitives]
-            los_prim = tf.boolean_mask(obj_primitive_idxs, tf.reduce_any(visible, axis=0))
-            candidates = los_prim[None, :]  # [1, num_candidates
-            candidates = tf.concat([tf.constant([[-1]], dtype=candidates.dtype), candidates], axis=1)
+        elif method == "env_driven":
+            if refl_diff:
+                raise ValueError("env_driven does not yet support mixed reflection-diffraction.")
+
+            primitive_ids = (
+                self.obj_geom.primitive_idxs if self.obj_geom is not None
+                else tf.range(tf.shape(self._primitives)[0], dtype=tf.int32)
+            )
+
+            num_sources = tf.shape(sources)[0]
+            devices = tf.concat([sources, targets], axis=0)
+            visible = self._my_list_candidates_env_depth_1(
+                devices, primitive_ids, transmission=transmission
+            )  # [num_sources + num_targets, num_facets]
+
+            tx_visible = visible[:num_sources]  # [num_sources, num_facets]
+            rx_visible = visible[num_sources:]  # [num_targets, num_facets]
+
+            def visible_edge_rows(mask):
+                # hits: [N, 2], columns [device, local facet index].
+                hits = tf.cast(tf.where(mask), tf.int32)
+                primitives = tf.gather(primitive_ids, hits[:, 1])
+                wedges = tf.gather(self._primitives_2_wedges, primitives)
+
+                rows = tf.stack([
+                    tf.repeat(hits[:, 0], tf.shape(wedges)[1]),
+                    tf.reshape(wedges, [-1]),
+                ], axis=1)
+                rows = tf.boolean_mask(rows, rows[:, 1] >= 0)
+
+                # Encode each [device, wedge] pair as a unique integer.
+                stride = tf.cast(tf.maximum(tf.shape(self._wedges_objects)[0], 1), tf.int64)
+                keys = tf.cast(rows[:, 0], tf.int64) * stride + tf.cast(rows[:, 1], tf.int64)
+                keys, _ = tf.unique(keys)
+
+                return tf.cast(tf.stack([keys // stride, keys % stride], axis=1), tf.int32)
+
+            tx_edges = visible_edge_rows(tx_visible)  # [num_tx_edges, 2]: [tx, wedge]
+            rx_edges = visible_edge_rows(rx_visible)  # [num_rx_edges, 2]: [rx, wedge]
+
+            # Keep the global primitive lists for the existing consumers.
+            los_prim = tf.boolean_mask(primitive_ids, tf.reduce_any(tx_visible, axis=0))
+            los_prim_t = tf.boolean_mask(primitive_ids, tf.reduce_any(rx_visible, axis=0))
+
+            # Use visible facets from either side for single-bounce reflections.
+            reflection_prims, _ = tf.unique(tf.concat([los_prim, los_prim_t], axis=0))
+            if not reflection or max_depth == 0:
+                reflection_prims = reflection_prims[:0]
+
+            candidates = reflection_prims[None, :]  # [1, num_candidates]
+            if los:
+                candidates = tf.concat([tf.constant([[-1]], candidates.dtype), candidates], axis=1)
+
+            _candidates = candidates
+            _candidates_t = None
+
+            # if scattering:
+            #     _, _, candidates_scat, hit_points = self._list_candidates_fibonacci(
+            #         max_depth, sources, num_samples, los, reflection,
+            #         scattering, scat_sparsity_coef,
+            #     )
             
         elif method == 'fibonacci':
             # Sample sequences of primitives using shoot-and-bounce
@@ -447,12 +502,11 @@ class SolverPaths(SolverBase):
         ############################################
         # Diffracted paths
         ############################################
+        wd_devices = (tx_edges, rx_edges) if method == "env_driven" and diffraction else None
         diff_paths, diff_paths_tmp = self.solver_wedge_diffraction.tracing(
-            sources, targets, los_prim, diffraction, edge_diffraction, transmission=transmission,
+            sources, targets, los_prim, diffraction, edge_diffraction,
+            transmission=transmission, device_candidates=wd_devices,
         )
-        
-        diff_paths, diff_paths_tmp = self.solver_wedge_diffraction.check_obstructions( \
-                diff_paths, diff_paths_tmp, diffraction)
 
         diff_paths.my_types = Paths.DIFFRACTED * tf.ones_like(diff_paths.objects, tf.int32)
 
@@ -468,8 +522,15 @@ class SolverPaths(SolverBase):
         vertex_diff_paths_tmp = PathsTmpData(sources, targets, self._dtype)
 
         if vertex_diffraction:
-            vertex_diff_paths, vertex_diff_paths_tmp = self.vertex_diffraction.tracing(sources, targets, 
-                                                     edge_diffraction=edge_diffraction, transmission=transmission)
+            vd_candidates = None
+            if method == "env_driven":
+                vd_candidates = self._build_env_vertex_rows(
+                    primitive_ids, tx_visible, rx_visible, self.obj_geom.active_vertices
+                )
+            vertex_diff_paths, vertex_diff_paths_tmp = self.vertex_diffraction.tracing(
+                sources, targets, edge_diffraction=edge_diffraction,
+                transmission=transmission, device_candidates=vd_candidates,
+            )
             vertex_diff_paths_tmp.junction_transmission = transmission
 
             vertex_diff_paths.my_types = Paths.VERTEX_DIFFRACTED * tf.ones_like(vertex_diff_paths.objects, tf.int32)
@@ -581,12 +642,21 @@ class SolverPaths(SolverBase):
             _, junction_enabled = self._build_slab_properties_tensors(array_size)
 
         if (los_prim is not None) and double_diffraction:
-            ###### 1)
-            if self.double_diffraction.is_wedge_wedge or self.double_diffraction.is_wedge_vertex or \
-                    self.double_diffraction.is_vertex_wedge or self.double_diffraction.is_vertex_vertex:
+            dd = self.double_diffraction
+            use_link_candidates = method in ("env_driven", "exhaustive")
+            trace_sv = dd.is_only_coplanar and dd.is_wedge_wedge_sv
+            trace_ev_ve = dd.is_wedge_vertex or dd.is_vertex_wedge
+            need_legacy_pairs = dd.is_vertex_vertex or (
+                not use_link_candidates and (trace_ev_ve or trace_sv)
+            )
+            need_global_pairs = need_legacy_pairs or (
+                dd.is_wedge_wedge and method != "env_driven"
+            )
+            if need_global_pairs:
                 wedges_1 = self._wedges_from_primitives(los_prim, True)
                 wedges_2 = self._wedges_from_primitives(los_prim_t, True)
-                if junction_enabled is not None:
+                
+                if junction_enabled is not None and method != "env_driven":
                     all_wedges = tf.range(tf.shape(self._wedges_objects)[0], dtype=tf.int32)
                     junctions = tf.boolean_mask(
                         all_wedges, self.double_diffraction._junction_candidates(all_wedges, junction_enabled)
@@ -609,16 +679,23 @@ class SolverPaths(SolverBase):
                 # [num_pairs, 2]
                 dd_pairs = tf.boolean_mask(dd_pairs, non_duplicates_mask, axis=0)
 
-                ### preliminary visibility
-                dd_pairs = self.double_diffraction.check_preliminary_visibility(dd_pairs, junction_enabled=junction_enabled)
+                pair_is_coplanar = self.double_diffraction.get_coplanar(dd_pairs)
 
-                ## Check if coplanar edges
                 if self.double_diffraction.is_only_coplanar:
-                    mask_coplanar = self.double_diffraction.get_coplanar(dd_pairs)
-                    dd_pairs = tf.boolean_mask(dd_pairs, mask_coplanar, axis=0)
+                    dd_pairs = tf.boolean_mask(dd_pairs, pair_is_coplanar)
                     self.double_diffraction.dd_pairs_coplanar = dd_pairs
+                    pair_is_coplanar = tf.ones_like(dd_pairs[:, 0], dtype=tf.bool)
 
-                if self.double_diffraction.is_wedge_vertex or self.double_diffraction.is_vertex_vertex:
+                ee_pairs = dd_pairs
+                ee_pair_is_coplanar = pair_is_coplanar
+
+                # Ordinary EE uses the final visibility check on the solved path.
+                if need_legacy_pairs:
+                    dd_pairs = dd.check_preliminary_visibility(
+                        dd_pairs, junction_enabled=junction_enabled
+                    )
+
+                if (not use_link_candidates and dd.is_wedge_vertex) or dd.is_vertex_vertex:
                     _v_idxs = tf.gather(self.obj_geom.wedge_2_vertices, dd_pairs[:, 1])
                     v_idxs2 = tf.reshape(_v_idxs, -1)
                     wv_pairs = tf.stack((tf.repeat(dd_pairs[:, 0], 2), v_idxs2), axis=1)
@@ -628,7 +705,7 @@ class SolverPaths(SolverBase):
                         tf.equal(wv_pairs[:, 1][..., None], active_vertices_dd_idxs[None, ...]), axis=1), axis=0)
                     
                 
-                if self.double_diffraction.is_vertex_wedge or self.double_diffraction.is_vertex_vertex:
+                if (not use_link_candidates and dd.is_vertex_wedge) or dd.is_vertex_vertex:
                     _v_idxs = tf.gather(self.obj_geom.wedge_2_vertices, dd_pairs[:, 0])
                     v_idxs1 = tf.reshape(_v_idxs, -1)
                     vw_pairs = tf.stack((v_idxs1, tf.repeat(dd_pairs[:, 1], 2)), axis=1)
@@ -644,56 +721,111 @@ class SolverPaths(SolverBase):
                     vv_pairs = tf.boolean_mask(vv_pairs, tf.reduce_any(
                         tf.equal(vv_pairs[:, 0][..., None], active_vertices_dd_idxs[None, ...]), axis=1), axis=0)
 
-            if self.double_diffraction.is_wedge_wedge:
-                ## Discard obstructed by wedges
-                # [num_sources, num_targets, num_pairs, 2]
-                dd_pair_idxs, active = self.double_diffraction.discard_obstructing(dd_pairs, sources, targets, junction_enabled=junction_enabled)
-                
-                if tf.shape(dd_pair_idxs)[2] != 0:
-                    # Find diffraction points
-                    # [num_sources, num_targets, num_pairs, 2, 3] and [num_sources, num_targets, num_pairs]
-                    if self.double_diffraction.is_only_coplanar:
-                        diff_points, valid = self.double_diffraction.compute_diffraction_points_analytical(sources, targets, dd_pair_idxs)
+            if dd.is_wedge_wedge:
+                if method == "env_driven":
+                    ee_rows = self._build_env_ee_rows(
+                        sources, targets, tx_edges, rx_edges, junction_enabled
+                    )
+                    ee_is_coplanar = dd.get_coplanar(ee_rows[:, 2:4])
+                    if dd.is_only_coplanar:
+                        ee_rows = tf.boolean_mask(ee_rows, ee_is_coplanar)
+                        ee_is_coplanar = tf.ones_like(ee_rows[:, 0], dtype=tf.bool)
+                else:
+                    # candidate_rows: [N, 3], columns [tx, rx, index in ee_pairs].
+                    candidate_rows = dd.discard_obstructing_flat(
+                        ee_pairs, sources, targets, junction_enabled=junction_enabled
+                    )
+                    pair_ids = candidate_rows[:, 2]
+                    ee_rows = tf.concat([
+                        candidate_rows[:, :2], tf.gather(ee_pairs, pair_ids)
+                    ], axis=1)
+                    ee_is_coplanar = tf.gather(ee_pair_is_coplanar, pair_ids)
+
+                # ee_rows: [N, 4], columns [tx, rx, first wedge, second wedge].
+                if tf.shape(ee_rows)[0] > 0:
+                    ee_tx = tf.gather(sources, ee_rows[:, 0])  # [N, 3]
+                    ee_rx = tf.gather(targets, ee_rows[:, 1])  # [N, 3]
+                    ee_wedges = ee_rows[:, 2:4]               # [N, 2]
+                    n_ee = tf.shape(ee_rows)[0]
+
+                    # Solve coplanar candidates first.
+                    cop_rows = tf.cast(tf.where(ee_is_coplanar)[:, 0], tf.int32)
+                    if tf.size(cop_rows) > 0:
+                        cop_points, cop_valid = (
+                            self.double_diffraction.compute_diffraction_points_coplanar_flat(
+                                tf.gather(ee_tx, cop_rows),
+                                tf.gather(ee_rx, cop_rows),
+                                tf.gather(ee_wedges, cop_rows),
+                            )
+                        )
+                        flat_points = tf.scatter_nd(cop_rows[:, None], cop_points, [n_ee, 2, 3])
+                        flat_valid = tf.scatter_nd(cop_rows[:, None], cop_valid, [n_ee])
                     else:
-                        diff_points, valid = self.double_diffraction.compute_diffraction_points(sources, targets, dd_pair_idxs)
+                        flat_points = tf.zeros([n_ee, 2, 3], dtype=self._rdtype)
+                        flat_valid = tf.zeros([n_ee], dtype=tf.bool)
 
-                    active = tf.logical_and(active, valid)
+                    if not self.double_diffraction.is_only_coplanar:
+                        # Includes skew pairs and failed analytical candidates.
+                        num_rows = tf.cast(tf.where(~flat_valid)[:, 0], tf.int32)
+                        if tf.size(num_rows) > 0:
+                            num_points, num_valid = (
+                                self.double_diffraction.compute_diffraction_points_noncoplanar_flat(
+                                    tf.gather(ee_tx, num_rows),
+                                    tf.gather(ee_rx, num_rows),
+                                    tf.gather(ee_wedges, num_rows),
+                                )
+                            )
+                            flat_points = tf.tensor_scatter_nd_update(
+                                flat_points, num_rows[:, None], num_points
+                            )
+                            flat_valid = tf.tensor_scatter_nd_update(
+                                flat_valid, num_rows[:, None], num_valid
+                            )
 
-                    if self.double_diffraction.is_only_close_2_transition:
-                        # tf.transpose(diff_points, perm=[3, 1, 0, 2, 4])
-                        valid = self.double_diffraction.close_2_transition(sources, targets, tf.transpose(diff_points, perm=[3, 0, 1, 2, 4]))
-                        active = tf.logical_and(active, valid)
+                    if tf.reduce_any(flat_valid):
+                        # Keep solved EE rows flat through all geometric and ray checks.
+                        solved_rows, solved_points = dd.filter_ee_paths_flat(
+                            sources, targets, tf.boolean_mask(ee_rows, flat_valid),
+                            tf.boolean_mask(flat_points, flat_valid),
+                            junction_enabled=junction_enabled,
+                        )
+                        dd_paths, dd_paths_tmp = dd.pack_ee_paths_flat(
+                            sources, targets, solved_rows, solved_points
+                        )
 
-                    # Find diff points which are located on finite wedges
-                    valid = self.double_diffraction.check_diff_points_validity(diff_points, dd_pair_idxs)
-                    active = tf.logical_and(active, valid)
+            if use_link_candidates and (trace_ev_ve or trace_sv):
+                if self.obj_geom is None:
+                    raise ValueError("EV, VE and SV tracing require ObjectsGeometry.")
+                if method == "env_driven":
+                    dd_tx_edges, dd_rx_edges = tx_edges, rx_edges
+                    if trace_ev_ve:
+                        dd_tx_vertices, dd_rx_vertices = self._build_env_vertex_rows(
+                            primitive_ids, tx_visible, rx_visible, self.obj_geom.active_vertices_dd
+                        )
+                else:
+                    n_tx, n_rx = tf.shape(sources)[0], tf.shape(targets)[0]
+                    dd_tx_edges = self._all_device_items(
+                        n_tx, self._wedges_from_primitives(los_prim, True)
+                    )
+                    dd_rx_edges = self._all_device_items(
+                        n_rx, self._wedges_from_primitives(los_prim_t, True)
+                    )
+                    if trace_ev_ve:
+                        vertex_ids = tf.cast(tf.where(self.obj_geom.active_vertices_dd)[:, 0], tf.int32)
+                        dd_tx_vertices = self._all_device_items(n_tx, vertex_ids)
+                        dd_rx_vertices = self._all_device_items(n_rx, vertex_ids)
 
-                    # Discard obstructed paths
-                    valid = self.double_diffraction._check_visibility(sources, targets, diff_points, dd_pair_idxs, junction_enabled=junction_enabled)
-                    active = tf.logical_and(active, valid)
+            # Shared-vertex candidates stay flat through the excess-length and ray checks.
+            if trace_sv and use_link_candidates:
+                sv_rows = self._build_sv_candidate_rows(sources, targets, dd_tx_edges, dd_rx_edges)
+                dd_paths_sv, dd_paths_sv_tmp = dd.trace_sv_flat(sources, targets, sv_rows)
+                if tf.reduce_any(dd_paths_sv.mask):
+                    dd_paths = merge_paths([dd_paths, dd_paths_sv])
+                    dd_paths_tmp = merge_paths_tmp([dd_paths_tmp, dd_paths_sv_tmp])
 
-                    dd_paths.objects = tf.transpose(dd_pair_idxs, perm=[3, 1, 0, 2])
-                    dd_paths.vertices = tf.transpose(diff_points, perm=[3, 1, 0, 2, 4])
-                    dd_paths.mask = tf.transpose(active, perm=[1, 0, 2]) #active
-
-                    dd_paths = self.double_diffraction._gather_valid_paths(dd_paths)
-                    dd_paths.dd_type = 0 * tf.ones(dd_paths.mask.shape, dtype=tf.int32)  # 0: double diffraction
-                    dd_paths.my_types = tf.stack([Paths.DIFFRACTED * tf.ones_like(dd_paths.mask, tf.int32), 
-                                                Paths.DIFFRACTED * tf.ones_like(dd_paths.mask, tf.int32)], 
-                                                axis=0)
-
-                    valid_wedge_idxs1 = tf.where(dd_paths.objects[0] == -1, 0, dd_paths.objects[0])
-                    valid_wedge_idxs2 = tf.where(dd_paths.objects[1] == -1, 0, dd_paths.objects[1])
-                    true_objects_1 = tf.gather(self._wedges_objects[:, 0], valid_wedge_idxs1, axis=0)
-                    true_objects_2 = tf.gather(self._wedges_objects[:, 0], valid_wedge_idxs2, axis=0)
-                    dd_paths.true_objects = tf.stack([true_objects_1, true_objects_2], axis=0)
-
-                    dd_paths, dd_paths_tmp =\
-                            self._compute_directions_distances_delays_angles(dd_paths, dd_paths_tmp, False)
-                
-            ############# 1a) shared vertex
-            if self.double_diffraction.is_only_coplanar and self.double_diffraction.is_wedge_wedge_sv:
-                dd_pair_idxs, active, valid_vertex_idxs = self.double_diffraction.shared_vertex(sources, targets, dd_pairs)
+            # Legacy SV tracing for the remaining candidate-selection methods.
+            if trace_sv and not use_link_candidates:
+                dd_pair_idxs, active, valid_vertex_idxs = dd.shared_vertex(sources, targets, dd_pairs)
                 valid_vertex_idxs = tf.where(valid_vertex_idxs == -1, 0, valid_vertex_idxs)
 
                 if tf.reduce_any(active):
@@ -743,124 +875,156 @@ class SolverPaths(SolverBase):
                     dd_paths = merge_paths([dd_paths, dd_paths_sv]) 
                     dd_paths_tmp = merge_paths_tmp([dd_paths_tmp, dd_paths_sv_tmp])
             
-            ######## 2) wedge_vertex
-            if self.double_diffraction.is_wedge_vertex:
-                dd_wedge_vertex = wv_pairs
+            # EV/VE candidates remain flat until the final Paths assembly.
+            if use_link_candidates:
+                for vertex_depth, enabled in ((1, dd.is_wedge_vertex), (0, dd.is_vertex_wedge)):
+                    if not enabled:
+                        continue
+                    if vertex_depth == 1:
+                        mixed_rows = self._build_mixed_candidate_rows(
+                            sources, targets, dd_tx_edges, dd_rx_vertices,
+                            vertex_first=False, junction_enabled=junction_enabled,
+                        )
+                    else:
+                        mixed_rows = self._build_mixed_candidate_rows(
+                            sources, targets, dd_tx_vertices, dd_rx_edges,
+                            vertex_first=True, junction_enabled=junction_enabled,
+                        )
+                    mixed, mixed_tmp = dd.trace_mixed_flat(
+                        sources, targets, mixed_rows, vertex_depth,
+                        junction_enabled=junction_enabled,
+                    )
+                    if tf.reduce_any(mixed.mask):
+                        dd_paths = merge_paths([dd_paths, mixed])
+                        dd_paths_tmp = merge_paths_tmp([dd_paths_tmp, mixed_tmp])
 
-                # [num_sources, num_targets, num_pairs, 2]
-                dd_wv_idxs, active =\
-                        self.double_diffraction.discard_obstructing_dd_wedge_vertex(dd_wedge_vertex, sources, targets, junction_enabled=junction_enabled)
-                
+            ######## 2) wedge_vertex
+            if self.double_diffraction.is_wedge_vertex and not use_link_candidates:
+                dd_wv_idxs, active = dd.discard_obstructing_dd_wedge_vertex(
+                    wv_pairs, sources, targets, junction_enabled=junction_enabled
+                )
+
                 if self.double_diffraction.is_only_in_nlos:
                     # set to False all paths in LOS
                     active = tf.logical_and(active, ~tf.transpose(self.is_los, [1, 0, 2]))
                 
-                # [2, num_sources, num_targets, num_pairs, 3] and [num_sources, num_targets, num_pairs]
-                diff_points2, valid2 = self.double_diffraction.compute_diffraction_points_wedge_vertex(sources, targets, dd_wv_idxs)
-                active = tf.logical_and(active, valid2)
-
-                ## discard if the diffraction points coincide
-                diff_points2, valid2 = self.double_diffraction.omit_identical_points(diff_points2)
-                active = tf.logical_and(active, valid2)
-
-                # Discard obstructed paths
-                valid2 = self.double_diffraction.check_visibility_mixed(sources, targets, diff_points2, dd_wv_idxs[..., 0], dd_wv_idxs[..., 1], junction_enabled=junction_enabled)
-                active = tf.logical_and(active, valid2)
-
-                ###
-                if self.double_diffraction.is_only_close_2_transition:
-                    valid2 = self.double_diffraction.close_2_transition(sources, targets, diff_points2)
+                if tf.reduce_any(active):
+                    # [2, num_sources, num_targets, num_pairs, 3] and [num_sources, num_targets, num_pairs]
+                    diff_points2, valid2 = self.double_diffraction.compute_diffraction_points_wedge_vertex(sources, targets, dd_wv_idxs)
                     active = tf.logical_and(active, valid2)
 
-                if tf.reduce_any(active):
-                    dd_paths_wv = Paths(sources=sources, targets=targets, scene=self._scene, types=Paths.DOUBLE_DIFF)
-                    dd_paths_wv_tmp = PathsTmpData(sources, targets, self._dtype)
+                    ## discard if the diffraction points coincide
+                    diff_points2, valid2 = self.double_diffraction.omit_identical_points(diff_points2)
+                    active = tf.logical_and(active, valid2)
 
-                    dd_paths_wv.objects = tf.transpose(dd_wv_idxs, perm=[3, 1, 0, 2])
-                    dd_paths_wv.vertices = tf.transpose(diff_points2, perm=[0, 2, 1, 3, 4])
-                    dd_paths_wv.mask = tf.transpose(active, perm=[1, 0, 2])
+                    # Discard obstructed paths
+                    valid2 = self.double_diffraction.check_visibility_mixed(sources, targets, diff_points2, dd_wv_idxs[..., 0], dd_wv_idxs[..., 1], junction_enabled=junction_enabled)
+                    active = tf.logical_and(active, valid2)
 
-                    dd_paths_wv = self.double_diffraction._gather_valid_paths(dd_paths_wv)
-                    dd_paths_wv.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_wv, vertex_depth=1, junction_enabled=junction_enabled)
-                    dd_paths_wv.dd_type = 1 * tf.ones(dd_paths_wv.mask.shape, dtype=tf.int32)  # 1: wedge-vertex
-                    dd_paths_wv.my_types = tf.stack([Paths.DIFFRACTED * tf.ones_like(dd_paths_wv.mask, tf.int32), 
-                                                     Paths.VERTEX_DIFFRACTED * tf.ones_like(dd_paths_wv.mask, tf.int32)], 
-                                                     axis=0)
+                    ###
+                    if self.double_diffraction.is_only_close_2_transition:
+                        valid2 = self.double_diffraction.close_2_transition(sources, targets, diff_points2)
+                        active = tf.logical_and(active, valid2)
 
-                    if dd_paths_wv.objects.shape[-1] != 0:
-                        valid_wedge_idxs = tf.where(dd_paths_wv.objects[0] == -1, 0, dd_paths_wv.objects[0])
-                        true_objects_1 = tf.gather(self._wedges_objects[:, 0], valid_wedge_idxs, axis=0)
-                        valid_vertex_idxs = tf.where(dd_paths_wv.objects[1] == -1, 0, dd_paths_wv.objects[1])
-                        true_objects_2 = tf.gather(self.vertex_diffraction.vertices_2_objects_sionna, valid_vertex_idxs)
-                        dd_paths_wv.true_objects = tf.stack([true_objects_1, true_objects_2], axis=0)
+                    if tf.reduce_any(active):
+                        dd_paths_wv = Paths(sources=sources, targets=targets, scene=self._scene, types=Paths.DOUBLE_DIFF)
+                        dd_paths_wv_tmp = PathsTmpData(sources, targets, self._dtype)
 
-                    dd_paths_wv, dd_paths_wv_tmp =\
-                            self._compute_directions_distances_delays_angles(dd_paths_wv, dd_paths_wv_tmp, False, True)
+                        dd_paths_wv.objects = tf.transpose(dd_wv_idxs, perm=[3, 1, 0, 2])
+                        dd_paths_wv.vertices = tf.transpose(diff_points2, perm=[0, 2, 1, 3, 4])
+                        dd_paths_wv.mask = tf.transpose(active, perm=[1, 0, 2])
 
-                    dd_paths = merge_paths([dd_paths, dd_paths_wv]) 
-                    dd_paths_tmp = merge_paths_tmp([dd_paths_tmp, dd_paths_wv_tmp])
+                        dd_paths_wv = self.double_diffraction._gather_valid_paths(dd_paths_wv)
+                        dd_paths_wv.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_wv, vertex_depth=1, junction_enabled=junction_enabled)
+                        if use_link_candidates:
+                            dd_paths_wv.mask &= tf.reduce_any(dd_paths_wv.vertex_wedge_mask, axis=-1)
+                            dd_paths_wv.objects = tf.where(
+                                dd_paths_wv.mask[None, ...], dd_paths_wv.objects, -1
+                            )
+                        dd_paths_wv.dd_type = 1 * tf.ones(dd_paths_wv.mask.shape, dtype=tf.int32)  # 1: wedge-vertex
+                        dd_paths_wv.my_types = tf.stack([Paths.DIFFRACTED * tf.ones_like(dd_paths_wv.mask, tf.int32), 
+                                                         Paths.VERTEX_DIFFRACTED * tf.ones_like(dd_paths_wv.mask, tf.int32)], 
+                                                         axis=0)
+
+                        if dd_paths_wv.objects.shape[-1] != 0:
+                            valid_wedge_idxs = tf.where(dd_paths_wv.objects[0] == -1, 0, dd_paths_wv.objects[0])
+                            true_objects_1 = tf.gather(self._wedges_objects[:, 0], valid_wedge_idxs, axis=0)
+                            valid_vertex_idxs = tf.where(dd_paths_wv.objects[1] == -1, 0, dd_paths_wv.objects[1])
+                            true_objects_2 = tf.gather(self.vertex_diffraction.vertices_2_objects_sionna, valid_vertex_idxs)
+                            dd_paths_wv.true_objects = tf.stack([true_objects_1, true_objects_2], axis=0)
+
+                        dd_paths_wv, dd_paths_wv_tmp =\
+                                self._compute_directions_distances_delays_angles(dd_paths_wv, dd_paths_wv_tmp, False, True)
+
+                        dd_paths = merge_paths([dd_paths, dd_paths_wv]) 
+                        dd_paths_tmp = merge_paths_tmp([dd_paths_tmp, dd_paths_wv_tmp])
 
             # ######## 3) vertex_wedge
-            if self.double_diffraction.is_vertex_wedge:
-
-                # [num_sources, num_targets, num_pairs, 2]
-                dd_vw_idxs, active =\
-                        self.double_diffraction.discard_obstructing_dd_vertex_wedge(vw_pairs, sources, targets, junction_enabled=junction_enabled)
+            if self.double_diffraction.is_vertex_wedge and not use_link_candidates:
+                dd_vw_idxs, active = dd.discard_obstructing_dd_vertex_wedge(
+                    vw_pairs, sources, targets, junction_enabled=junction_enabled
+                )
 
                 if self.double_diffraction.is_only_in_nlos:
                     # set to False all paths in LOS
                     active = tf.logical_and(active, ~tf.transpose(self.is_los, [1, 0, 2]))
                 
-                # [2, num_sources, num_targets, num_pairs, 3] and [num_sources, num_targets, num_pairs]
-                diff_points3, valid3 = self.double_diffraction.compute_diffraction_points_vertex_wedge(sources, targets, dd_vw_idxs)
-                active = tf.logical_and(active, valid3)
-
-                ## discard if the diffraction points coincide
-                diff_points3, valid3 = self.double_diffraction.omit_identical_points(diff_points3)
-                active = tf.logical_and(active, valid3)
-
-                # Discard obstructed paths
-                # Reverse interaction order and swap link axes for the EV visibility check.
-                reverse_points = tf.transpose(diff_points3[::-1], [0, 2, 1, 3, 4])
-                reverse_pairs = tf.transpose(dd_vw_idxs, [1, 0, 2, 3])
-                valid3 = self.double_diffraction.check_visibility_mixed(
-                    targets, sources, reverse_points, reverse_pairs[..., 1], reverse_pairs[..., 0],
-                    junction_enabled=junction_enabled,
-                )
-                valid3 = tf.transpose(valid3, perm=[1, 0, 2])  
-                active = tf.logical_and(active, valid3)
-
-                if self.double_diffraction.is_only_close_2_transition:
-                    valid3 = self.double_diffraction.close_2_transition(sources, targets, diff_points3)
-                    active = tf.logical_and(active, valid3)      
-
                 if tf.reduce_any(active):
-                    dd_paths_vw = Paths(sources=sources, targets=targets, scene=self._scene, types=Paths.DOUBLE_DIFF)
-                    dd_paths_vw_tmp = PathsTmpData(sources, targets, self._dtype)
+                    # [2, num_sources, num_targets, num_pairs, 3] and [num_sources, num_targets, num_pairs]
+                    diff_points3, valid3 = self.double_diffraction.compute_diffraction_points_vertex_wedge(sources, targets, dd_vw_idxs)
+                    active = tf.logical_and(active, valid3)
 
-                    dd_paths_vw.objects = tf.transpose(dd_vw_idxs, perm=[3, 1, 0, 2])
-                    dd_paths_vw.vertices = tf.transpose(diff_points3, perm=[0, 2, 1, 3, 4])
-                    dd_paths_vw.mask = tf.transpose(active, perm=[1, 0, 2])
+                    ## discard if the diffraction points coincide
+                    diff_points3, valid3 = self.double_diffraction.omit_identical_points(diff_points3)
+                    active = tf.logical_and(active, valid3)
 
-                    dd_paths_vw = self.double_diffraction._gather_valid_paths(dd_paths_vw)
-                    dd_paths_vw.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_vw, vertex_depth=0, junction_enabled=junction_enabled)
-                    
-                    dd_paths_vw.dd_type = 2 * tf.ones(dd_paths_vw.mask.shape, dtype=tf.int32)  # 2: vertex-wedge
-                    dd_paths_vw.my_types = tf.stack([Paths.VERTEX_DIFFRACTED * tf.ones_like(dd_paths_vw.mask, tf.int32), 
-                                                     Paths.DIFFRACTED * tf.ones_like(dd_paths_vw.mask, tf.int32)], 
-                                                     axis=0)
-                    if dd_paths_vw.objects.shape[-1] != 0:
-                        valid_vertex_idxs = tf.where(dd_paths_vw.objects[0] == -1, 0, dd_paths_vw.objects[0])
-                        true_objects_1 = tf.gather(self.vertex_diffraction.vertices_2_objects_sionna, valid_vertex_idxs)
-                        valid_wedge_idxs = tf.where(dd_paths_vw.objects[1] == -1, 0, dd_paths_vw.objects[1])
-                        true_objects_2 = tf.gather(self._wedges_objects[:, 0], valid_wedge_idxs, axis=0)
-                        dd_paths_vw.true_objects = tf.stack([true_objects_1, true_objects_2], axis=0)
+                    # Discard obstructed paths
+                    # Reverse interaction order and swap link axes for the EV visibility check.
+                    reverse_points = tf.transpose(diff_points3[::-1], [0, 2, 1, 3, 4])
+                    reverse_pairs = tf.transpose(dd_vw_idxs, [1, 0, 2, 3])
+                    valid3 = self.double_diffraction.check_visibility_mixed(
+                        targets, sources, reverse_points, reverse_pairs[..., 1], reverse_pairs[..., 0],
+                        junction_enabled=junction_enabled,
+                    )
+                    valid3 = tf.transpose(valid3, perm=[1, 0, 2])  
+                    active = tf.logical_and(active, valid3)
 
-                    dd_paths_vw, dd_paths_vw_tmp =\
-                            self._compute_directions_distances_delays_angles(dd_paths_vw, dd_paths_vw_tmp, False, True)
-                    
-                    dd_paths = merge_paths([dd_paths, dd_paths_vw]) 
-                    dd_paths_tmp = merge_paths_tmp([dd_paths_tmp, dd_paths_vw_tmp])
+                    if self.double_diffraction.is_only_close_2_transition:
+                        valid3 = self.double_diffraction.close_2_transition(sources, targets, diff_points3)
+                        active = tf.logical_and(active, valid3)      
+
+                    if tf.reduce_any(active):
+                        dd_paths_vw = Paths(sources=sources, targets=targets, scene=self._scene, types=Paths.DOUBLE_DIFF)
+                        dd_paths_vw_tmp = PathsTmpData(sources, targets, self._dtype)
+
+                        dd_paths_vw.objects = tf.transpose(dd_vw_idxs, perm=[3, 1, 0, 2])
+                        dd_paths_vw.vertices = tf.transpose(diff_points3, perm=[0, 2, 1, 3, 4])
+                        dd_paths_vw.mask = tf.transpose(active, perm=[1, 0, 2])
+
+                        dd_paths_vw = self.double_diffraction._gather_valid_paths(dd_paths_vw)
+                        dd_paths_vw.vertex_wedge_mask = self.double_diffraction._vertex_wedge_mask(dd_paths_vw, vertex_depth=0, junction_enabled=junction_enabled)
+                        if use_link_candidates:
+                            dd_paths_vw.mask &= tf.reduce_any(dd_paths_vw.vertex_wedge_mask, axis=-1)
+                            dd_paths_vw.objects = tf.where(
+                                dd_paths_vw.mask[None, ...], dd_paths_vw.objects, -1
+                            )
+
+                        dd_paths_vw.dd_type = 2 * tf.ones(dd_paths_vw.mask.shape, dtype=tf.int32)  # 2: vertex-wedge
+                        dd_paths_vw.my_types = tf.stack([Paths.VERTEX_DIFFRACTED * tf.ones_like(dd_paths_vw.mask, tf.int32), 
+                                                         Paths.DIFFRACTED * tf.ones_like(dd_paths_vw.mask, tf.int32)], 
+                                                         axis=0)
+                        if dd_paths_vw.objects.shape[-1] != 0:
+                            valid_vertex_idxs = tf.where(dd_paths_vw.objects[0] == -1, 0, dd_paths_vw.objects[0])
+                            true_objects_1 = tf.gather(self.vertex_diffraction.vertices_2_objects_sionna, valid_vertex_idxs)
+                            valid_wedge_idxs = tf.where(dd_paths_vw.objects[1] == -1, 0, dd_paths_vw.objects[1])
+                            true_objects_2 = tf.gather(self._wedges_objects[:, 0], valid_wedge_idxs, axis=0)
+                            dd_paths_vw.true_objects = tf.stack([true_objects_1, true_objects_2], axis=0)
+
+                        dd_paths_vw, dd_paths_vw_tmp =\
+                                self._compute_directions_distances_delays_angles(dd_paths_vw, dd_paths_vw_tmp, False, True)
+
+                        dd_paths = merge_paths([dd_paths, dd_paths_vw]) 
+                        dd_paths_tmp = merge_paths_tmp([dd_paths_tmp, dd_paths_vw_tmp])
 
             # ######## 4) vertex_vertex
             if self.double_diffraction.is_vertex_vertex:
@@ -1171,7 +1335,8 @@ class SolverPaths(SolverBase):
         if diff_paths.objects.shape[3] > 0:
             # Compute the transition matrices and Doppler shifts
             diff_mat_t = self.solver_wedge_diffraction.compute_fields(
-                etas, scattering_coefficient, diff_paths, diff_paths_tmp
+                etas, scattering_coefficient, diff_paths, diff_paths_tmp,
+                spec_paths=spec_paths, spec_paths_tmp=spec_paths_tmp,
             )
 
             diff_mat_t = self.solver_reflection._apply_diffraction_transmission(
@@ -1613,22 +1778,294 @@ class SolverPaths(SolverBase):
 
         return all_candidates, los_candidates
 
-    def _my_list_candidates_env_depth_1(self, devices, primitive_idxs=None):
+    def _intersect_env_candidates(self, tx_rows, rx_rows, num_sources, num_targets):
+        """Intersect [device, item] rows per link.
+
+        Returns item IDs [K] and their candidate mask [num_targets, num_sources, K].
+        Both input row lists must be deduplicated.
+        """
+        item_ids, slots = tf.unique(tf.concat([tx_rows[:, 1], rx_rows[:, 1]], axis=0))
+        n_items = tf.size(item_ids)
+        n_tx_rows = tf.shape(tx_rows)[0]
+
+        def device_mask(rows, item_slots, num_devices):
+            indices = tf.stack([rows[:, 0], item_slots], axis=1)
+            return tf.scatter_nd(
+                indices, tf.ones_like(item_slots, dtype=tf.bool),
+                tf.stack([num_devices, n_items]),
+            )
+
+        tx_mask = device_mask(tx_rows, slots[:n_tx_rows], num_sources)
+        rx_mask = device_mask(rx_rows, slots[n_tx_rows:], num_targets)
+        common = tf.reduce_any(tx_mask, axis=0) & tf.reduce_any(rx_mask, axis=0)
+        cols = tf.where(common)[:, 0]
+        tx_mask = tf.gather(tx_mask, cols, axis=1)
+        rx_mask = tf.gather(rx_mask, cols, axis=1)
+        return tf.gather(item_ids, cols), rx_mask[:, None, :] & tx_mask[None, :, :]
+
+    def _build_env_vertex_candidates(self, primitive_ids, tx_visible, rx_visible):
+        """Find per-link VD candidates from visible triangle vertices."""
+        if self.obj_geom is None:
+            raise ValueError("env_driven vertex diffraction requires ObjectsGeometry.")
+        tx_rows, rx_rows = self._build_env_vertex_rows(
+            primitive_ids, tx_visible, rx_visible, self.obj_geom.active_vertices
+        )
+        return self._intersect_env_candidates(
+            tx_rows, rx_rows, tf.shape(tx_visible)[0], tf.shape(rx_visible)[0]
+        )
+
+    def _build_env_vertex_rows(self, primitive_ids, tx_visible, rx_visible, active_vertices):
+        """Return separate [device, vertex] lists before any per-link intersection."""
+        geom = self.obj_geom
+        if geom is None:
+            raise ValueError("env_driven vertex diffraction requires ObjectsGeometry.")
+
+        # Map global mesh vertex IDs to ObjectsGeometry vertex rows.
+        global_ids = tf.cast(geom._vertex_indices, tf.int32)
+        global_to_vd = tf.tensor_scatter_nd_update(
+            tf.fill([tf.shape(self._vertices)[0]], -1),
+            global_ids[:, None],
+            tf.range(tf.size(global_ids), dtype=tf.int32),
+        )
+        face_vertices = tf.gather(global_to_vd, tf.gather(self._faces, primitive_ids))
+
+        def vertex_rows(visible):
+            hits = tf.cast(tf.where(visible), tf.int32)
+            vertices = tf.reshape(tf.gather(face_vertices, hits[:, 1]), [-1])
+            rows = tf.stack([tf.repeat(hits[:, 0], 3), vertices], axis=1)
+            rows = tf.boolean_mask(rows, rows[:, 1] >= 0)
+            rows = tf.boolean_mask(rows, tf.gather(active_vertices, rows[:, 1]))
+            rows, _ = tf.raw_ops.UniqueV2(x=rows, axis=[0])
+            return rows
+
+        return vertex_rows(tx_visible), vertex_rows(rx_visible)
+
+    def _check_env_first_order_visibility(self, sources, targets, indices, points, case):
+        """Trace only actual first-order candidates; keep the original slots."""
+        rows = tf.cast(tf.where(indices >= 0), tf.int32)
+        if tf.shape(rows)[0] == 0:
+            return indices
+
+        interactions = tf.gather_nd(points, rows)
+        valid = tf.ones([tf.shape(rows)[0]], dtype=tf.bool)
+        if case in ("both", "tx"):
+            tx = tf.gather(sources, rows[:, 1])
+            directions, distances = normalize(interactions - tx)
+            valid &= ~self._test_obstruction(tx, directions, distances)
+        if case in ("both", "rx"):
+            rx = tf.gather(targets, rows[:, 0])
+            directions, distances = normalize(interactions - rx)
+            valid &= ~self._test_obstruction(rx, directions, distances)
+
+        rejected = tf.boolean_mask(rows, ~valid)
+        return tf.tensor_scatter_nd_update(
+            indices, rejected, tf.fill([tf.shape(rejected)[0]], tf.cast(-1, indices.dtype))
+        )
+
+    @staticmethod
+    def _all_device_items(num_devices, items):
+        """List all [device, item] rows for exhaustive candidate selection."""
+        items = tf.cast(items, tf.int32)
+        return tf.stack([
+            tf.repeat(tf.range(num_devices), tf.size(items)),
+            tf.tile(items, [num_devices]),
+        ], axis=1)
+
+    def _pack_link_pair_rows(self, rows, sources, targets):
+        """Adapt flat [tx, rx, item1, item2] rows to the existing solvers."""
+        num_sources, num_targets = tf.shape(sources)[0], tf.shape(targets)[0]
+        if tf.shape(rows)[0] == 0:
+            return (tf.fill([num_sources, num_targets, 0, 2], -1),
+                    tf.zeros([num_sources, num_targets, 0], dtype=tf.bool),
+                    (tf.zeros([0, 3], dtype=tf.int32), tf.zeros([0, 3], dtype=tf.int32)))
+        row_ids = tf.range(tf.shape(rows)[0], dtype=tf.int32)
+        return self.double_diffraction.pack_ee_candidates(
+            rows[:, 2:4], tf.concat([rows[:, :2], row_ids[:, None]], axis=1),
+            num_sources, num_targets,
+        )
+
+    @staticmethod
+    def _pair_device_items(tx_rows, rx_rows, n_tx, n_rx):
+        """Form [tx, rx, item1, item2] products for each link."""
+        def prepare(rows, num_devices):
+            rows = tf.gather(rows, tf.argsort(rows[:, 0], stable=True))
+            counts = tf.math.unsorted_segment_sum(
+                tf.ones_like(rows[:, 0]), rows[:, 0], num_devices
+            )
+            return rows[:, 1], counts, tf.cumsum(counts, exclusive=True)
+
+        items_tx, counts_tx, offsets_tx = prepare(tx_rows, n_tx)
+        items_rx, counts_rx, offsets_rx = prepare(rx_rows, n_rx)
+        counts = tf.reshape(counts_tx[:, None] * counts_rx[None, :], [-1])
+        links = tf.repeat(tf.range(n_tx * n_rx), counts)
+        local = tf.range(tf.reduce_sum(counts)) - tf.repeat(
+            tf.cumsum(counts, exclusive=True), counts
+        )
+        tx, rx = links // tf.maximum(n_rx, 1), links % tf.maximum(n_rx, 1)
+        rx_count = tf.gather(counts_rx, rx)
+        item1 = tf.gather(items_tx, tf.gather(offsets_tx, tx) + local // rx_count)
+        item2 = tf.gather(items_rx, tf.gather(offsets_rx, rx) + local % rx_count)
+        return tf.stack([tx, rx, item1, item2], axis=1)
+
+    def _build_mixed_candidate_rows(
+        self, sources, targets, tx_rows, rx_rows, vertex_first, junction_enabled=None
+    ):
+        """Build EV/VE rows and check the exterior sector at the ordinary edge."""
+        rows = self._pair_device_items(
+            tx_rows, rx_rows, tf.shape(sources)[0], tf.shape(targets)[0]
+        )
+        if vertex_first:
+            wedges, vertices = rows[:, 3], rows[:, 2]
+            outer = tf.gather(targets, rows[:, 1])
+        else:
+            wedges, vertices = rows[:, 2], rows[:, 3]
+            outer = tf.gather(sources, rows[:, 0])
+
+        origins = tf.gather(self._wedges_origin, wedges)
+        normals = tf.gather(self._wedges_normals, wedges)
+        d_outer = dot((outer - origins)[:, None, :], normals)
+        d_inner = dot((tf.gather(self.obj_geom._vertices, vertices) - origins)[:, None, :], normals)
+        eps = tf.cast(self.EPSILON, d_outer.dtype)
+        allowed = tf.reduce_any(d_outer > eps, axis=1) & tf.reduce_any(d_inner > -eps, axis=1)
+
+        if junction_enabled is not None:
+            wd = self.solver_wedge_diffraction
+            crossed = wd._is_flat_shared_wedge(wedges) & wd._opposite_sides(
+                d_outer[:, 0], d_inner[:, 0]
+            )
+            eligible = self.double_diffraction._junction_candidates(wedges, junction_enabled)
+            allowed = tf.where(crossed, eligible, allowed)
+        allowed |= tf.gather(self._is_edge, wedges)
+        return tf.boolean_mask(rows, allowed)
+
+    def _build_sv_candidate_rows(self, sources, targets, tx_edges, rx_edges):
+        """Join edge candidates by their shared vertex, yielding [tx, rx, w1, w2, vertex]."""
+        # Invert the actual VD incidence table; its rows use ObjectsGeometry IDs.
+        vertex_to_wedges = self.obj_geom.vertex_2_wedges
+        topology = tf.stack([
+            tf.cast(vertex_to_wedges.values, tf.int32),
+            tf.cast(vertex_to_wedges.value_rowids(), tf.int32),
+        ], axis=1)
+        topology = tf.boolean_mask(topology, topology[:, 0] >= 0)
+        if tf.shape(topology)[0] == 0:
+            return tf.zeros([0, 5], dtype=tf.int32)
+        topology = tf.gather(topology, tf.argsort(topology[:, 0], stable=True))
+
+        def expand_endpoints(edges, devices):
+            device = tf.gather(devices, edges[:, 0])
+            wedges = edges[:, 1]
+            origins = tf.gather(self._wedges_origin, wedges)
+            normals = tf.gather(self._wedges_normals, wedges)
+            signed = dot((device - origins)[:, None, :], normals)
+            outside = tf.reduce_any(signed > tf.cast(self.EPSILON, signed.dtype), axis=1)
+            edges = tf.boolean_mask(edges, outside)
+
+            lo = tf.searchsorted(topology[:, 0], edges[:, 1], side="left")
+            hi = tf.searchsorted(topology[:, 0], edges[:, 1], side="right")
+            incident = tf.gather(topology[:, 1], tf.ragged.range(lo, hi).flat_values)
+            rows = tf.concat([tf.repeat(edges, hi - lo, axis=0), incident[:, None]], axis=1)
+            rows, _ = tf.raw_ops.UniqueV2(x=rows, axis=[0])
+            return rows
+
+        tx = expand_endpoints(tx_edges, sources)
+        rx = expand_endpoints(rx_edges, targets)
+        if tf.shape(tx)[0] == 0 or tf.shape(rx)[0] == 0:
+            return tf.zeros([0, 5], dtype=tf.int32)
+
+        # Locate only RX edges sharing the vertex of each TX edge.
+        rx = tf.gather(rx, tf.argsort(rx[:, 2], stable=True))
+        lo = tf.searchsorted(rx[:, 2], tx[:, 2], side="left")
+        hi = tf.searchsorted(rx[:, 2], tx[:, 2], side="right")
+        left = tf.repeat(tf.range(tf.shape(tx)[0]), hi - lo)
+        right = tf.ragged.range(lo, hi).flat_values
+        tx = tf.gather(tx, left)
+        rx = tf.gather(rx, right)
+        rows = tf.stack([tx[:, 0], rx[:, 0], tx[:, 1], rx[:, 1], tx[:, 2]], axis=1)
+        rows = tf.boolean_mask(rows, rows[:, 2] != rows[:, 3])
+
+        # Preserve the SV sector checks for the other edge and the coplanar tolerance.
+        wedges = rows[:, 2:4]
+        origins = tf.gather(self._wedges_origin, wedges)
+        normals = tf.gather(self._wedges_normals, wedges)
+        delta = origins[:, 1] - origins[:, 0]
+        d1 = dot(delta[:, None, :], normals[:, 0])
+        d2 = dot(-delta[:, None, :], normals[:, 1])
+        eps = tf.cast(self.EPSILON, d1.dtype)
+        allowed = tf.reduce_any(d1 > -eps, axis=1) & tf.reduce_any(d2 > -eps, axis=1)
+        return tf.boolean_mask(rows, allowed & self.double_diffraction.get_coplanar(wedges))
+
+    def _build_env_ee_rows(self, sources, targets, tx_edges, rx_edges,
+                           junction_enabled=None):
+        """Build [N, 4] rows [tx, rx, w1, w2] from per-device edge lists."""
+        num_sources = tf.shape(sources)[0]
+        num_targets = tf.shape(targets)[0]
+
+        def prepare(devices, edge_rows):
+            # edge_rows: [M, 2], columns [device ID, wedge ID].
+            device_ids, wedges = tf.unstack(edge_rows, num=2, axis=1)
+            offsets = tf.gather(devices, device_ids) - tf.gather(self._wedges_origin, wedges)
+            normals = tf.gather(self._wedges_normals, wedges)
+            signed = dot(offsets[:, None, :], normals)  # [M, 2]
+            allowed = tf.reduce_any(
+                signed > tf.cast(self.EPSILON, signed.dtype), axis=1
+            )
+            allowed |= tf.gather(self._is_edge, wedges)
+            if junction_enabled is not None:
+                allowed |= self.double_diffraction._junction_candidates(wedges, junction_enabled)
+
+            rows = tf.boolean_mask(edge_rows, allowed)
+            rows = tf.gather(rows, tf.argsort(rows[:, 0], stable=True))
+            counts = tf.math.unsorted_segment_sum(
+                tf.ones_like(rows[:, 0]), rows[:, 0], tf.shape(devices)[0]
+            )
+            return rows[:, 1], counts, tf.cumsum(counts, exclusive=True)
+
+        tx_wedges, tx_counts, tx_offsets = prepare(sources, tx_edges)
+        rx_wedges, rx_counts, rx_offsets = prepare(targets, rx_edges)
+
+        # Enumerate the edge products only for their corresponding links.
+        counts = tf.reshape(tx_counts[:, None] * rx_counts[None, :], [-1])
+        link = tf.repeat(tf.range(num_sources * num_targets), counts)
+        local = tf.range(tf.reduce_sum(counts)) - tf.repeat(
+            tf.cumsum(counts, exclusive=True), counts
+        )
+        tx = link // tf.maximum(num_targets, 1)
+        rx = link % tf.maximum(num_targets, 1)
+        n_rx = tf.gather(rx_counts, rx)
+        w1 = tf.gather(tx_wedges, tf.gather(tx_offsets, tx) + local // n_rx)
+        w2 = tf.gather(rx_wedges, tf.gather(rx_offsets, rx) + local % n_rx)
+
+        rows = tf.stack([tx, rx, w1, w2], axis=1)
+        return tf.boolean_mask(rows, w1 != w2)
+
+    def _my_list_candidates_env_depth_1(self, devices, primitive_idxs=None,
+                                         transmission=False):
+        """Return facet-center visibility with shape [num_devices, num_facets]."""
         if primitive_idxs is None:
             primitive_idxs = tf.range(tf.shape(self._primitives)[0], dtype=tf.int32)
 
         triangles = tf.gather(self._primitives, primitive_idxs)
         centers = tf.reduce_mean(triangles, axis=1)
         rays = centers[None, :, :] - devices[:, None, :]
-        directions, distances = tf.linalg.normalize(rays, axis=-1)
-        origins = tf.broadcast_to(devices[:, None, :], tf.shape(rays))
+        shape = tf.shape(rays)[:2]
 
-        blocked = self._test_obstruction(
-            tf.reshape(origins, [-1, 3]),
-            tf.reshape(directions, [-1, 3]),
-            tf.reshape(distances, [-1]),
-        )
-        return tf.reshape(~blocked, tf.shape(rays)[:2])
+        if tf.size(rays) == 0:
+            return tf.zeros(shape, tf.bool)
+
+        origins = tf.reshape(tf.broadcast_to(devices[:, None, :], tf.shape(rays)), [-1, 3])
+        endpoints = tf.reshape(tf.broadcast_to(centers[None, :, :], tf.shape(rays)), [-1, 3])
+
+        if transmission:
+            # Only the blocked mask is needed for candidate selection.
+            ray_ids = tf.range(tf.shape(origins)[0], dtype=tf.int32)[:, None]
+            blocked, _ = self.solver_reflection._trace_transmission_segments(
+                origins, endpoints, ray_ids
+            )
+        else:
+            directions, distances = normalize(endpoints - origins)
+            blocked = self._test_obstruction(origins, directions, distances)
+
+        return tf.reshape(~blocked, shape)
     
     def _my_list_candidates_depth_1(self, sources, primitive_idxs=None):
         # self.obj
@@ -3620,7 +4057,7 @@ class SolverPaths(SolverBase):
 
         # find diffraction from source images to targets
         diff_paths, diff_paths_tmp = self.solver_wedge_diffraction.tracing(source_images, targets, \
-                                        los_prim, True, False)
+                                        los_prim, True, False, flat=False)
         
         diff_paths, diff_paths_tmp = self.solver_wedge_diffraction.check_obstructions( \
                 diff_paths, diff_paths_tmp, True, case='rx')

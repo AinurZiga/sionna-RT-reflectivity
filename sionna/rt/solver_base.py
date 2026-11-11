@@ -122,6 +122,7 @@ class SolverBase:
             self._wedges_normals = solver._wedges_normals
             self._primitives_2_wedges = solver._primitives_2_wedges
             self._wedges_objects = solver._wedges_objects
+            self._wedges_2_primitives = solver._wedges_2_primitives
             self._is_edge = solver._is_edge
 
             self._vertices = solver._vertices
@@ -201,6 +202,7 @@ class SolverBase:
             self._wedges_objects,
             self._is_edge,
             self._is_concave_wedge,
+            self._wedges_2_primitives,
         ) = self._extract_wedges()
 
 
@@ -905,6 +907,7 @@ class SolverBase:
                     wedges_2_object,        # wedges_objects
                     is_edge,                 # is_edge
                     is_concave_wedge,
+                    wedges_2_prim,
                  )
 
         return output

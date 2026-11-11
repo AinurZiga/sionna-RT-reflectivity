@@ -49,21 +49,6 @@ class DiffractionTables:
         self.file_T_ev_1 = data_dir / "T_ev_even_linear_table.npz"
         self.file_T_ev_2 = data_dir / "T_ev_odd_linear_table.npz"
 
-# class DiffractionTables:
-#     """Load shared GFI tables once and retain paths to EV transition tables."""
-
-#     def __init__(self, dtype=tf.complex64, use_gfi_lookup=True, gfi_filename=None):
-#         self.dtype = tf.as_dtype(dtype)
-#         data_dir = Path(__file__).resolve().parent / "data"
-#         gfi_filename = data_dir / "gfi_hybrid_tables2.npz" if gfi_filename is None else Path(gfi_filename)
-
-#         self.gfi_lookup = GFILookup(gfi_filename, dtype=self.dtype) if use_gfi_lookup else None
-
-#         # These independent EV tables are still required by double diffraction.
-#         self.file_T_ev_1 = data_dir / "T_ev_even_linear_table_new.npz"
-#         self.file_T_ev_2 = data_dir / "T_ev_odd_linear_table_new.npz"
-
-
 def calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat):
     r"""
     Input

@@ -1383,10 +1383,16 @@ def invert_s_t(paths: Paths, paths_tmp: PathsTmpData):
     new_paths.tau = tf.transpose(paths.tau, perm=[1, 0, 2])
     new_paths.types = paths.types
 
-    try:
-        new_paths_tmp.normals = tf.transpose(paths_tmp.normals, perm=[1, 0, 2, 3])
-    except:
-        pass
+    normals = paths_tmp.normals
+
+    if normals.shape.rank == 5:
+        # [depth, targets, sources, paths, xyz]: reverse interactions and swap devices.
+        new_paths_tmp.normals = tf.transpose(normals[::-1], [0, 2, 1, 3, 4])
+    elif normals.shape.rank == 4:
+        # Legacy layout without an interaction axis.
+        new_paths_tmp.normals = tf.transpose(normals, [1, 0, 2, 3])
+    else:
+        raise ValueError(f"Unexpected paths_tmp.normals shape: {normals.shape}")
     
     new_paths_tmp.k_i = tf.transpose(paths_tmp.k_i[::-1], perm=[0, 2, 1, 3, 4])
     new_paths_tmp.k_r = tf.transpose(paths_tmp.k_r[::-1], perm=[0, 2, 1, 3, 4])

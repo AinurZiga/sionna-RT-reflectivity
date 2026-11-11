@@ -13,7 +13,8 @@ from sionna.constants import SPEED_OF_LIGHT, PI
 from sionna.utils.tensors import expand_to_rank, insert_dims, flatten_dims,\
     split_dim, insert_dim_num
 from .paths import Paths, PathsTmpData
-from .diffraction_funcs import calc_angles, calc_angles_concave, func_G_approximated_capolino, t_gfi_full_approximated_capolino
+from .diffraction_funcs import calc_angles, calc_angles_concave, func_G_approximated_capolino, \
+    t_gfi_full_approximated_capolino, fresnel_integral_capolino
 from .utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
         compute_field_unit_vectors, reflection_coefficient, slab_coefficients,\
@@ -32,6 +33,7 @@ class VertexDiffraction:
         self._rdtype = self.solver_paths._rdtype
 
         self.is_setup = False
+        self.use_stable_sb = False
         self.is_refl_vd = False
 
         # [num_primitives, 3]
@@ -117,7 +119,162 @@ class VertexDiffraction:
 
         return output
 
-    def tracing(self, sources, targets, case="both", is_dd=False, edge_diffraction=True, transmission=False):
+    def tracing(self, sources, targets, case="both", is_dd=False, edge_diffraction=True,
+                transmission=False, link_candidates=None, device_candidates=None, flat=True):
+        """Trace ordinary VD using flat vertex paths and flat constituent edges.
+
+        Path rows: [N, 3], columns [rx, tx, ObjectsGeometry vertex ID].
+        Edge rows: [M], path-row IDs, wedge IDs and local edge slots.
+        Only final Paths objects carry padded path and constituent-edge axes.
+        Mixed reflection-VD tracing retains its virtual-source convention.
+        """
+        if is_dd or not flat:
+            return self._tracing_legacy(
+                sources, targets, case, is_dd, edge_diffraction, transmission, link_candidates
+            )
+        if case not in ("both", "tx", "rx"):
+            raise ValueError(f"Unknown vertex diffraction case: {case!r}")
+        solver = self.solver_paths
+        paths = Paths(sources, targets, solver._scene, types=Paths.VERTEX_DIFFRACTED)
+        tmp = PathsTmpData(sources, targets, self._dtype)
+        tmp.junction_transmission = transmission
+        rows = self._flat_vertex_candidates(sources, targets, link_candidates, device_candidates)
+
+        # Expand the ragged incidence rows directly, without a max_vertex_edges axis.
+        incidence = tf.gather(self.vertices_2_wedges, rows[:, 2])
+        edge_paths = tf.cast(incidence.value_rowids(), tf.int32)
+        wedges = tf.cast(incidence.values, tf.int32)
+        lengths = tf.cast(incidence.row_lengths(), tf.int32)
+        edge_slots = tf.range(tf.size(wedges)) - tf.repeat(
+            tf.cast(incidence.row_splits[:-1], tf.int32), lengths
+        )
+        real_edges = wedges >= 0
+        edge_paths, wedges, edge_slots = [
+            tf.boolean_mask(x, real_edges) for x in (edge_paths, wedges, edge_slots)
+        ]
+
+        enabled = None
+        if transmission and case == "both" and tf.size(solver._primitives_2_objects) > 0:
+            size = tf.reduce_max(solver._primitives_2_objects) + 1
+            _, enabled = solver._build_slab_properties_tensors(size)
+        allowed = self._flat_vertex_edge_visibility(
+            rows, edge_paths, wedges, sources, targets, case, edge_diffraction, enabled
+        )
+        edge_paths, wedges, edge_slots = [
+            tf.boolean_mask(x, allowed) for x in (edge_paths, wedges, edge_slots)
+        ]
+        counts = tf.math.unsorted_segment_sum(
+            tf.ones_like(edge_paths), edge_paths, tf.shape(rows)[0]
+        )
+        has_edge = counts > 0
+        # Remove paths with no allowed constituent edge before tracing any rays.
+        compact_ids = tf.cumsum(tf.cast(has_edge, tf.int32)) - 1
+        edge_paths = tf.gather(compact_ids, edge_paths)
+        rows = tf.boolean_mask(rows, has_edge)
+        points = tf.gather(self._vertices, rows[:, 2])
+        tx = tf.gather(sources, rows[:, 1])
+        rx = tf.gather(targets, rows[:, 0])
+        records = None
+        if enabled is not None:
+            ids = tf.range(tf.shape(rows)[0], dtype=tf.int32)[:, None]
+            tracer = solver.solver_reflection._trace_transmission_segments
+            blocked_in, incoming = tracer(tx, points, ids, enabled)
+            blocked_out, outgoing = tracer(points, rx, ids, enabled)
+            visible = ~(blocked_in | blocked_out)
+            records = (
+                tf.concat([incoming[0][:, 0], outgoing[0][:, 0]], axis=0),
+                tf.concat([incoming[1], outgoing[1]], axis=0),
+                tf.concat([incoming[2], outgoing[2]], axis=0),
+                tf.concat([incoming[3], outgoing[3]], axis=0),
+                tf.concat([tf.zeros_like(incoming[1]), tf.ones_like(outgoing[1])], axis=0),
+            )
+        else:
+            visible = tf.ones([tf.shape(rows)[0]], tf.bool)
+            if tf.shape(rows)[0] > 0:
+                if case in ("both", "tx"):
+                    direction, distance = normalize(points - tx)
+                    visible &= ~solver._test_obstruction(tx, direction, distance)
+                if case in ("both", "rx"):
+                    direction, distance = normalize(points - rx)
+                    visible &= ~solver._test_obstruction(rx, direction, distance)
+
+        # VD keeps distinct vertices even when their departure/arrival angles match.
+        paths, tmp, kept_ids, indices = solver.solver_wedge_diffraction._pack_flat_paths(
+            paths, tmp, rows, points, visible, records,
+            deduplicate=False, path_type=Paths.VERTEX_DIFFRACTED, return_indices=True,
+        )
+        mapping = tf.tensor_scatter_nd_update(
+            tf.fill([tf.shape(rows)[0], 3], -1), kept_ids[:, None], indices
+        )
+        keep_edges = tf.gather(visible, edge_paths)
+        edge_paths = tf.boolean_mask(edge_paths, keep_edges)
+        edge_slots = tf.boolean_mask(edge_slots, keep_edges)
+        edge_indices = tf.concat([tf.gather(mapping, edge_paths), edge_slots[:, None]], axis=1)
+        max_edges = tf.reduce_max(tf.concat([
+            tf.cast(self.vertices_2_wedges.row_lengths(), tf.int32), tf.zeros([1], tf.int32)
+        ], axis=0))
+        paths.vertex_wedge_mask = tf.scatter_nd(
+            edge_indices, tf.ones_like(edge_paths, tf.bool),
+            tf.concat([tf.shape(paths.mask), [max_edges]], axis=0),
+        )
+        return paths, tmp
+
+    def _flat_vertex_candidates(self, sources, targets, link_candidates, device_candidates):
+        """Return only actual [rx, tx, vertex] rows in per-link candidate order."""
+        if device_candidates is not None:
+            tx_rows, rx_rows = device_candidates
+            vertices, slots = tf.unique(tf.concat([tx_rows[:, 1], rx_rows[:, 1]], axis=0))
+            n_tx = tf.shape(tx_rows)[0]
+            tx_rows = tf.stack([tx_rows[:, 0], slots[:n_tx]], axis=1)
+            rx_rows = tf.stack([rx_rows[:, 0], slots[n_tx:]], axis=1)
+            # The join is index-based and works for vertex IDs as well as wedge IDs.
+            return self.solver_paths.solver_wedge_diffraction._join_device_wedges(
+                tx_rows, rx_rows, vertices, tf.shape(sources)[0]
+            )
+        if link_candidates is not None:
+            vertices, mask = link_candidates
+            hits = tf.cast(tf.where(mask), tf.int32)
+            return tf.stack([hits[:, 0], hits[:, 1], tf.gather(vertices, hits[:, 2])], axis=1)
+        vertices = tf.cast(tf.where(self.obj_geom.active_vertices)[:, 0], tf.int32)
+        n_vertices = tf.size(vertices)
+        num_tx = tf.shape(sources)[0]
+        count = tf.shape(targets)[0] * num_tx * n_vertices
+        ids = tf.range(count, dtype=tf.int32)
+        # Safe divisors also cover empty scenes and zero-device batches.
+        vertex_slots = ids % tf.maximum(n_vertices, 1)
+        links = ids // tf.maximum(n_vertices, 1)
+        return tf.stack([
+            links // tf.maximum(num_tx, 1), links % tf.maximum(num_tx, 1),
+            tf.gather(vertices, vertex_slots),
+        ], axis=1)
+
+    def _flat_vertex_edge_visibility(self, rows, edge_paths, wedges, sources, targets,
+                                     case, edge_diffraction, enabled):
+        """Apply the existing sector, planar-edge and junction rules to [M] edges."""
+        solver = self.solver_paths
+        origins = tf.gather(solver._wedges_origin, wedges)
+        normals = tf.gather(solver._wedges_normals, wedges)
+        path_rows = tf.gather(rows, edge_paths)
+        tx = tf.gather(sources, path_rows[:, 1])
+        rx = tf.gather(targets, path_rows[:, 0])
+        d_tx = dot((tx - origins)[:, None, :], normals)
+        d_rx = dot((rx - origins)[:, None, :], normals)
+        eps = tf.cast(solver.EPSILON, d_tx.dtype)
+        allowed = tf.ones(tf.shape(wedges), tf.bool)
+        if case in ("both", "tx"):
+            allowed &= tf.reduce_any(d_tx > eps, axis=1)
+        if case in ("both", "rx"):
+            allowed &= tf.reduce_any(d_rx > eps, axis=1)
+        if enabled is not None:
+            wd = solver.solver_wedge_diffraction
+            crossed = wd._is_flat_shared_wedge(wedges) & wd._opposite_sides(d_tx[:, 0], d_rx[:, 0])
+            face_flags = tf.gather(enabled, tf.gather(solver._wedges_objects, wedges))
+            allowed = tf.where(crossed, face_flags[:, 0] != face_flags[:, 1], allowed)
+        is_edge = tf.gather(solver._is_edge, wedges)
+        return (allowed | is_edge) if edge_diffraction else (allowed & ~is_edge)
+
+    def _tracing_legacy(self, sources, targets, case="both", is_dd=False, edge_diffraction=True,
+                transmission=False, link_candidates=None):
         """
         Trace vertex diffracted paths between sources and targets.
         is_dd (double-diffraction) to get vertices for double-diffraction
@@ -129,45 +286,22 @@ class VertexDiffraction:
         num_sources = tf.shape(sources)[0]
         num_targets = tf.shape(targets)[0]
 
-        if is_dd:
-            active = self.obj_geom.active_vertices_dd
+        candidate_mask = None
+        if link_candidates is None:
+            active = self.obj_geom.active_vertices_dd if is_dd else self.obj_geom.active_vertices
+            vertex_ids = tf.cast(tf.where(active)[:, 0], tf.int32)
         else:
-            active = self.obj_geom.active_vertices
+            vertex_ids, candidate_mask = link_candidates
 
-        vertices = tf.boolean_mask(self._vertices, active)
-        vertices_2_wedges = tf.ragged.boolean_mask(self.obj_geom.vertex_2_wedges, active)
-
-        num_vertices = vertices.shape[0]
-
-        # [num_targets, num_sources, max_num_paths / num_wedges_per_vertex]
-        vertices_2_edges_row_lengths = vertices_2_wedges.row_lengths()
-
-        # [num_targets, num_sources, max_num_paths, 3]  
-        #[ 1, max_num_paths, 3]
-        diff_vertex_points = tf.expand_dims(vertices, axis=0)
-        # [1, 1, max_num_paths, 3]
-        diff_vertex_points = tf.expand_dims(diff_vertex_points, axis=0)
-        # [num_targets, num_sources, max_num_paths, 3]
-        # diff_vertex_points = tf.repeat(diff_vertex_points, num_targets, axis=0)
-        # diff_vertex_points = tf.repeat(diff_vertex_points, num_sources, axis=1)
-
-        diff_vertex_points = tf.broadcast_to(diff_vertex_points, [num_targets, num_sources, num_vertices, 3])
-
-        # [num_vertex_wedges]
-        # vertex_wedges_indices = self.vertices_2_wedges.values
-        vertex_wedges_indices = vertices_2_wedges.values
-
-        # # map back to original vertex indices (using active)
-        vertex_indices = tf.cast(tf.where(active)[:, 0], dtype=tf.int32)
-
-        # [1, max_num_paths / num_wedges_per_vertex]
-        vertex_indices = tf.expand_dims(vertex_indices, axis=0)
-        # [1, 1, max_num_paths / num_wedges_per_vertex]
-        vertex_indices = tf.expand_dims(vertex_indices, axis=0)
-        # [num_targets, num_sources, max_num_paths / num_wedges_per_vertex]
-        # vertex_indices = tf.repeat(vertex_indices, num_targets, axis=0)
-        # vertex_indices = tf.repeat(vertex_indices, num_sources, axis=1)
-        vertex_indices = tf.broadcast_to(vertex_indices, [num_targets, num_sources, num_vertices])
+        # vertex_ids are rows of ObjectsGeometry, not global scene vertex IDs.
+        vertices = tf.gather(self._vertices, vertex_ids)
+        vertex_shape = [num_targets, num_sources, tf.shape(vertex_ids)[0]]
+        diff_vertex_points = tf.broadcast_to(
+            vertices[None, None, :, :], vertex_shape + [3]
+        )
+        vertex_indices = tf.broadcast_to(vertex_ids[None, None, :], vertex_shape)
+        if candidate_mask is not None:
+            vertex_indices = tf.where(candidate_mask, vertex_indices, -1)
 
         # Discard obstructed diffracted paths
         # Only check for vertex visibility if there is at least one vertex-candidate
@@ -177,7 +311,14 @@ class VertexDiffraction:
                 vertex_indices = self.solver_paths.solver_reflection._trace_diffraction_transmissions(
                     vertex_indices, diff_vertex_points, sources, targets, vd_paths_tmp
                 )
+            elif link_candidates is not None:
+                vertex_indices = self.solver_paths._check_env_first_order_visibility(
+                    sources, targets, vertex_indices, diff_vertex_points, case
+                )
             else:
+                vertex_wedges = tf.gather(self.obj_geom.vertex_2_wedges, vertex_ids)
+                vertex_wedges_indices = vertex_wedges.values
+                vertices_2_edges_row_lengths = vertex_wedges.row_lengths()
                 vertex_indices, vertex_wedges_indices, diff_vertex_points, valid_vertex_idxs = (
                     self._check_vertices_visibility(
                         targets, sources, vertex_indices, vertex_wedges_indices,
@@ -190,44 +331,71 @@ class VertexDiffraction:
                                                        diff_vertex_points)
 
             vd_paths.vertex_wedge_mask = self._visible_vertex_wedges(
-                vd_paths, case, edge_diffraction=edge_diffraction
+                vd_paths, case, edge_diffraction=edge_diffraction,
+                transmission=transmission, check_half_spaces=not is_dd,
             )
             vd_paths.mask &= tf.reduce_any(vd_paths.vertex_wedge_mask, axis=-1)
             vd_paths.objects = tf.where(vd_paths.mask[None, ...], vd_paths.objects, -1)
 
         return vd_paths, vd_paths_tmp
 
-    def _visible_vertex_wedges(self, paths, case, edge_diffraction=True):
-        """Select existing constituent wedges, optionally excluding single-face edges.
-
-        Parameters
-        ----------
-        paths : Paths
-            Vertex paths after visibility checks.
-        case : str
-            Retained for interface compatibility; half-space filtering is disabled.
-        edge_diffraction : bool
-            If False, exclude constituent edges marked with solver._is_edge.
-
-        Returns
-        -------
-        tf.Tensor, bool, shape [targets, sources, paths, max_vertex_edges]
-            Mask of constituent edges included in the field calculation.
-        """
-
+    def _visible_vertex_wedges(
+        self, paths, case, edge_diffraction=True, transmission=False,
+        check_half_spaces=True,
+    ):
+        """Return the constituent-edge mask [targets, sources, paths, edges]."""
+        solver = self.solver_paths
         vertex_idxs = paths.objects[0]
-        safe_vertices = tf.where(vertex_idxs >= 0, vertex_idxs, 0)
+        safe_vertices = tf.maximum(vertex_idxs, 0)
         wedge_table = self.vertices_2_wedges.to_tensor(default_value=-1)
         wedges = tf.gather(wedge_table, safe_vertices)
-
         valid = (wedges >= 0) & (vertex_idxs[..., None] >= 0) & paths.mask[..., None]
 
-        if not edge_diffraction:
-            safe_wedges = tf.where(wedges >= 0, wedges, 0)
-            is_edge = tf.gather(self.solver_paths._is_edge, safe_wedges)
-            valid &= ~is_edge
+        # Keep the existing policy for mixed paths traced with virtual sources.
+        if not check_half_spaces and edge_diffraction:
+            return valid
 
-        return valid
+        # Only check real constituent edges of surviving vertex paths.
+        rows = tf.cast(tf.where(valid), tf.int32)  # [N, 4]: [rx, tx, path, edge slot]
+        if tf.shape(rows)[0] == 0:
+            return valid
+
+        wedge_ids = tf.gather_nd(wedges, rows)
+        is_edge = tf.gather(solver._is_edge, wedge_ids)
+        if not check_half_spaces:
+            return tf.scatter_nd(rows, ~is_edge, tf.shape(valid))
+
+        origins = tf.gather(solver._wedges_origin, wedge_ids)
+        normals = tf.gather(solver._wedges_normals, wedge_ids)
+        tx = tf.gather(paths.sources, rows[:, 1])
+        rx = tf.gather(paths.targets, rows[:, 0])
+        d_tx = dot((tx - origins)[:, None, :], normals)  # [N, 2]
+        d_rx = dot((rx - origins)[:, None, :], normals)  # [N, 2]
+        eps = tf.cast(solver.EPSILON, d_tx.dtype)
+
+        allowed = tf.ones_like(is_edge)
+        if case in ("both", "tx"):
+            allowed &= tf.reduce_any(d_tx > eps, axis=1)
+        if case in ("both", "rx"):
+            allowed &= tf.reduce_any(d_rx > eps, axis=1)
+        if case not in ("both", "tx", "rx"):
+            raise ValueError(f"Unknown vertex diffraction case: {case!r}")
+
+        if transmission and case == "both":
+            # Apply the same flat-junction rule as ordinary wedge diffraction.
+            wd = solver.solver_wedge_diffraction
+            crossed_flat = wd._is_flat_shared_wedge(wedge_ids) & wd._opposite_sides(
+                d_tx[:, 0], d_rx[:, 0]
+            )
+            array_size = tf.reduce_max(solver._primitives_2_objects) + 1
+            _, enabled = solver._build_slab_properties_tensors(array_size)
+            face_objects = tf.gather(solver._wedges_objects, wedge_ids)
+            face_enabled = tf.gather(enabled, face_objects)
+            mixed = face_enabled[:, 0] != face_enabled[:, 1]
+            allowed = tf.where(crossed_flat, mixed, allowed)
+
+        allowed = allowed | is_edge if edge_diffraction else allowed & ~is_edge
+        return tf.scatter_nd(rows, allowed, tf.shape(valid))
 
     def _check_vertices_visibility(self, targets, sources, vertices_indices,
                                 vertex_wedges_indices, vertices, vertices_2_edges_row_lengths, case='both'):
@@ -585,9 +753,9 @@ class VertexDiffraction:
         indices = tf.cast(tf.where(paths.vertex_wedge_mask & paths.mask[..., None]), tf.int32)
         path_indices = indices[:, :3]
 
-        wedge_table = self.vertices_2_wedges.to_tensor(default_value=-1)
         vertex_idxs = tf.cast(tf.gather_nd(paths.objects[0], path_indices), tf.int32)
-        wedge_idxs = tf.gather_nd(wedge_table, tf.stack([vertex_idxs, indices[:, 3]], axis=-1))
+        offsets = tf.gather(tf.cast(self.vertices_2_wedges.row_splits, tf.int32), vertex_idxs)
+        wedge_idxs = tf.gather(self.vertices_2_wedges.values, offsets + indices[:, 3])
 
         valid = wedge_idxs >= 0
         indices = tf.boolean_mask(indices, valid)
@@ -789,11 +957,11 @@ class VertexDiffraction:
         r_0 = -tf.matmul(w_r_0, tf.stack([r_s_0, r_p_0], axis=-1)[..., None] * w_i_0)
         r_n = -tf.matmul(w_r_n, tf.stack([r_s_n, r_p_n], axis=-1)[..., None] * w_i_n)
 
-        cos_difference = -2.0 * tf.sin(0.5 * (beta_prime + beta)) * tf.sin(0.5 * (beta_prime - beta))
-        coef = -1.0 / tf.complex(tf.cast(0.0, self._rdtype), 2.0 * k * PI * cos_difference)
+        # cos_difference = -2.0 * tf.sin(0.5 * (beta_prime + beta)) * tf.sin(0.5 * (beta_prime - beta))
+        # coef = -1.0 / tf.complex(tf.cast(0.0, self._rdtype), 2.0 * k * PI * cos_difference)
         
         step = (wedge_n * PI - phi + 1e-5 > 0.0) & (wedge_n * PI - phi_prime + 1e-5 > 0.0)
-        coef *= tf.cast(step, self._dtype)
+        # coef *= tf.cast(step, self._dtype)
 
         param_u = self._get_param_u(beta_prime, beta)
         param_b = tf.repeat(self._get_param_b(k, s_prime, s, beta_prime, beta)[:, None], 4, axis=-1)
@@ -809,8 +977,31 @@ class VertexDiffraction:
             self._get_tip_a_minus(phi_p, wedge_n, k, ell),
         ], axis=-1)
 
-        coefficients, func_B, (_, gfi) = self._get_coefs_D2(wedge_n, param_a, param_b, param_u, phi_prime, phi)
-        d1, d2, d3, d4 = [self._clear_vertex_edge_nan(coef * d) for d in coefficients]
+        # coefficients, func_B, (_, gfi) = self._get_coefs_D2(wedge_n, param_a, param_b, param_u, phi_prime, phi)
+        if self.use_stable_sb:
+            terms = self._vertex_sb_terms(
+                k, s_prime, s, beta_prime, beta, wedge_n,
+                param_a, param_b, param_u, phi_m, phi_p,
+            )
+            terms *= tf.cast(step[:, None], self._dtype)
+            coefficients = tf.unstack(terms, num=4, axis=-1)
+        else:
+            cos_difference = (
+                -2.0 * tf.sin(0.5 * (beta_prime + beta))
+                * tf.sin(0.5 * (beta_prime - beta))
+            )
+            denominator = 2.0 * k * PI * cos_difference
+            coef = -1.0 / tf.complex(tf.zeros_like(denominator), denominator)
+            coef *= tf.cast(step, self._dtype)
+
+            d, _, _ = self._get_coefs_D2(
+                wedge_n, param_a, param_b, param_u, phi_prime, phi
+            )
+            coefficients = tuple(coef * value for value in d)
+
+        d1, d2, d3, d4 = [self._clear_vertex_edge_nan(d) for d in coefficients]
+
+        # d1, d2, d3, d4 = [self._clear_vertex_edge_nan(coef * d) for d in coefficients]
 
         eye = tf.eye(2, batch_shape=tf.shape(wedge_n), dtype=self._dtype)
         mat_t = (d1 + d2)[:, None, None] * eye + d3[:, None, None] * r_n + d4[:, None, None] * r_0
@@ -846,6 +1037,70 @@ class VertexDiffraction:
         ), self._dtype)
         mat_t = tf.matmul(mat_to_gcs, tf.matmul(mat_t, mat_from_gcs))
         return self._clear_vertex_edge_nan(mat_t)
+
+    def _vertex_sb_terms(self, k, s_prime, s, beta_prime, beta, n,
+                         a, b, u, phi_m, phi_p):
+        """Evaluate the four VD terms, including the outer prefactor."""
+        joint_origin = (a == 0.0) & (b == 0.0)
+        tf.debugging.assert_equal(
+            tf.reduce_any(joint_origin), False,
+            message="VD: a=b=0 requires a joint GO/WD/VD limit.",
+        )
+
+        h = tf.sin(0.5 * (beta - beta_prime))
+        sin_mean = tf.sin(0.5 * (beta + beta_prime))
+        K = tf.sqrt(2.0 * k * s_prime * s / (s_prime + s))
+        t = K * h
+
+        Phi = tf.stack(
+            [PI + phi_m, PI - phi_m, PI + phi_p, PI - phi_p], axis=-1
+        )
+        B = self._get_func_B(Phi, u[:, None], n[:, None])
+
+        small_a = (b > 0.0) & (a <= 1e-4 * tf.minimum(b, 1.0))
+        stable = (b <= 1e-2) & (a > 0.0) & ~small_a
+        stable_idx = tf.where(stable)
+        regular_idx = tf.where(~stable)
+
+        # Evaluate the legacy GFI only where b is strictly positive.
+        regular_rows = regular_idx[:, 0]
+        cos_diff = tf.gather(2.0 * sin_mean * h, regular_rows)
+        denominator = 2.0 * k * PI * cos_diff
+        coef = -1.0 / tf.complex(tf.zeros_like(denominator), denominator)
+        T = t_gfi_full_approximated_capolino(
+            tf.gather_nd(b, regular_idx),
+            tf.gather_nd(a, regular_idx),
+            self.obj_geom.diffraction_tables,
+        )
+        regular_values = coef * tf.cast(tf.gather_nd(B, regular_idx), self._dtype) * T
+
+        stable_rows = stable_idx[:, 0]
+        a_sb = tf.gather_nd(a, stable_idx)
+        y = tf.sqrt(a_sb)
+        t_sb = tf.gather(t, stable_rows)
+        b_sb = tf.square(t_sb)
+
+        # At t=0, select the positive one-sided value for now.
+        side = tf.where(t_sb < 0.0, -tf.ones_like(t_sb), tf.ones_like(t_sb))
+        alpha = tf.atan2(t_sb, y)
+        Q = fresnel_integral_capolino(tf.complex(y, tf.zeros_like(y)), y)
+        phase = tf.exp(tf.complex(tf.zeros_like(y), tf.fill(tf.shape(y), tf.cast(PI / 4.0, y.dtype))))
+        G0 = phase * Q / tf.cast(2.0 * tf.sqrt(tf.cast(PI, y.dtype)), self._dtype)
+        G_signed = tf.exp(tf.complex(tf.zeros_like(b_sb), b_sb)) * (
+            tf.cast(side, self._dtype) * G0
+            - tf.cast(alpha / (2.0 * PI), self._dtype)
+            + tf.complex(tf.zeros_like(y), y * (t_sb - y * alpha) / (2.0 * PI))
+        )
+
+        W = (a_sb + b_sb) * tf.gather_nd(B, stable_idx) / y
+        prefactor = -tf.gather(K / (k * sin_mean), stable_rows)
+        stable_values = tf.cast(prefactor * W, self._dtype) * G_signed
+
+        return tf.scatter_nd(
+            tf.concat([regular_idx, stable_idx], axis=0),
+            tf.concat([regular_values, stable_values], axis=0),
+            tf.shape(a, out_type=tf.int64),
+        )
 
     def _clear_vertex_edge_nan(self, value):
         return tf.where(tf.math.is_nan(tf.math.real(value)), tf.zeros_like(value), value)

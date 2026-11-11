@@ -28,50 +28,320 @@ class WedgeDiffraction:
         self._dtype = solver._dtype
         self._rdtype = solver._rdtype
 
-    def tracing(self, sources, targets, los_prim, diffraction, edge_diffraction, case='both', 
-                transmission=False) -> Tuple[Paths, PathsTmpData]:
+        self.warn_sb_side_mismatch = True
+        self.sb_warning_tol = 1e-5  # Radians
+
+    def tracing(self, sources, targets, los_prim, diffraction, edge_diffraction,
+                case="both", transmission=False, link_candidates=None,
+                device_candidates=None, flat=True) -> Tuple[Paths, PathsTmpData]:
+        """Trace ordinary WD with flat candidates, packing only the final paths.
+
+        Candidate rows have shape [N, 3] and contain [rx, tx, wedge].
+        device_candidates is a pair of deduplicated [device, wedge] lists,
+        for TX and RX respectively. The legacy link_candidates=(wedges, mask)
+        interface remains supported. Set flat=False for reflection-WD paths
+        whose visibility must be completed later using virtual sources.
+        """
+        if not flat:
+            return self._tracing_legacy(
+                sources, targets, los_prim, diffraction, edge_diffraction,
+                case, transmission, link_candidates,
+            )
+        if case not in ("both", "tx", "rx"):
+            raise ValueError(f"Unknown wedge diffraction case: {case!r}")
+
+        paths = Paths(sources, targets, self._scene, types=Paths.DIFFRACTED)
+        tmp = PathsTmpData(sources, targets, self._dtype)
+        tmp.junction_transmission = transmission
+        if not diffraction or (
+            device_candidates is None and link_candidates is None
+            and los_prim is None and not transmission
+        ):
+            return paths, tmp
+        num_wedges = tf.shape(self.solver._wedges_origin)[0]
+        if num_wedges == 0:
+            return paths, tmp
+
+        enabled = None
+        if transmission and case == "both":
+            size = tf.reduce_max(self.solver._primitives_2_objects) + 1
+            _, enabled = self.solver._build_slab_properties_tensors(size)
+
+        rows = self._flat_candidates(
+            sources, targets, los_prim, edge_diffraction, case, enabled,
+            link_candidates, device_candidates,
+        )
+        points, valid = self._flat_diffraction_points(
+            tf.gather(sources, rows[:, 1]), tf.gather(targets, rows[:, 0]), rows[:, 2]
+        )
+        rows, points = tf.boolean_mask(rows, valid), tf.boolean_mask(points, valid)
+        if tf.shape(rows)[0] == 0:
+            return paths, tmp
+
+        tx, rx = tf.gather(sources, rows[:, 1]), tf.gather(targets, rows[:, 0])
+        records = None
+        if enabled is not None:
+            # Record flat row IDs; convert to final path slots only after filtering.
+            ids = tf.range(tf.shape(rows)[0], dtype=tf.int32)[:, None]
+            tracer = self.solver.solver_reflection._trace_transmission_segments
+            blocked_in, incoming = tracer(tx, points, ids, enabled)
+            blocked_out, outgoing = tracer(points, rx, ids, enabled)
+            valid = ~(blocked_in | blocked_out)
+            records = (
+                tf.concat([incoming[0][:, 0], outgoing[0][:, 0]], axis=0),
+                tf.concat([incoming[1], outgoing[1]], axis=0),
+                tf.concat([incoming[2], outgoing[2]], axis=0),
+                tf.concat([incoming[3], outgoing[3]], axis=0),
+                tf.concat([tf.zeros_like(incoming[1]), tf.ones_like(outgoing[1])], axis=0),
+            )
+        else:
+            valid = tf.ones([tf.shape(rows)[0]], tf.bool)
+            if case in ("both", "tx"):
+                direction, distance = normalize(points - tx)
+                valid &= ~self.solver._test_obstruction(tx, direction, distance)
+            if case in ("both", "rx"):
+                direction, distance = normalize(points - rx)
+                valid &= ~self.solver._test_obstruction(rx, direction, distance)
+
+        return self._pack_flat_paths(paths, tmp, rows, points, valid, records)
+
+    @staticmethod
+    def _join_device_wedges(tx_rows, rx_rows, wedges, num_sources):
+        """Join [device, wedge-slot] lists into [rx, tx, global wedge] rows."""
+        tx_rows = tf.gather(tx_rows, tf.argsort(tx_rows[:, 1], stable=True))
+        lo = tf.searchsorted(tx_rows[:, 1], rx_rows[:, 1], side="left")
+        hi = tf.searchsorted(tx_rows[:, 1], rx_rows[:, 1], side="right")
+        tx = tf.gather(tx_rows, tf.ragged.range(lo, hi).flat_values)
+        rx = tf.repeat(rx_rows, hi - lo, axis=0)
+        # Preserve candidate order within each link, including duplicate tie-breaking.
+        key = ((tf.cast(rx[:, 0], tf.int64) * tf.cast(num_sources, tf.int64)
+                + tf.cast(tx[:, 0], tf.int64)) * tf.cast(tf.size(wedges), tf.int64)
+               + tf.cast(rx[:, 1], tf.int64))
+        order = tf.argsort(key, stable=True)
+        rows = tf.stack([rx[:, 0], tx[:, 0], tf.gather(wedges, rx[:, 1])], axis=1)
+        return tf.gather(rows, order)
+
+    def _flat_candidates(self, sources, targets, los_prim, edge_diffraction, case,
+                         enabled, link_candidates, device_candidates):
+        """Build candidates without a [num_targets, num_sources, wedges] tensor."""
+        if device_candidates is not None:
+            tx_rows, rx_rows = device_candidates
+            # tf.unique retains the same wedge ordering as the legacy intersection.
+            wedges, slots = tf.unique(tf.concat([tx_rows[:, 1], rx_rows[:, 1]], axis=0))
+            n_tx = tf.shape(tx_rows)[0]
+            tx_rows = tf.stack([tx_rows[:, 0], slots[:n_tx]], axis=1)
+            rx_rows = tf.stack([rx_rows[:, 0], slots[n_tx:]], axis=1)
+            rows = self._join_device_wedges(tx_rows, rx_rows, wedges, tf.shape(sources)[0])
+        elif link_candidates is not None:
+            wedges, mask = link_candidates
+            hits = tf.cast(tf.where(mask), tf.int32)
+            rows = tf.stack([hits[:, 0], hits[:, 1], tf.gather(wedges, hits[:, 2])], axis=1)
+        else:
+            wedges = (tf.zeros([0], tf.int32) if los_prim is None else
+                      self.solver._wedges_from_primitives(los_prim, edge_diffraction))
+            if enabled is not None:
+                all_wedges = tf.range(tf.shape(self.solver._wedges_origin)[0], dtype=tf.int32)
+                flags = tf.gather(enabled, self.solver._wedges_objects)
+                junction = self._is_flat_shared_wedge(all_wedges) & (flags[:, 0] != flags[:, 1])
+                wedges, _ = tf.unique(tf.concat([wedges, tf.boolean_mask(all_wedges, junction)], axis=0))
+
+            origins = tf.gather(self.solver._wedges_origin, wedges)
+            normals = tf.gather(self.solver._wedges_normals, wedges)
+            exceptions = tf.gather(self.solver._is_edge, wedges)
+            if enabled is not None:
+                flags = tf.gather(enabled, tf.gather(self.solver._wedges_objects, wedges))
+                exceptions |= self._is_flat_shared_wedge(wedges) & (flags[:, 0] != flags[:, 1])
+
+            def device_rows(devices, check):
+                # Only device-by-wedge arrays are needed before joining the lists.
+                if check:
+                    signed = dot((devices[:, None, :] - origins)[..., None, :], normals)
+                    allowed = tf.reduce_any(signed > tf.cast(self.solver.EPSILON, signed.dtype), axis=-1)
+                    allowed |= exceptions[None, :]
+                else:
+                    allowed = tf.ones([tf.shape(devices)[0], tf.size(wedges)], tf.bool)
+                return tf.cast(tf.where(allowed), tf.int32)
+
+            rows = self._join_device_wedges(
+                device_rows(sources, case in ("both", "tx")),
+                device_rows(targets, case in ("both", "rx")),
+                wedges, tf.shape(sources)[0],
+            )
+
+        wedge_ids = rows[:, 2]
+        if not edge_diffraction:
+            rows = tf.boolean_mask(rows, ~tf.gather(self.solver._is_edge, wedge_ids))
+            wedge_ids = rows[:, 2]
+        origins = tf.gather(self.solver._wedges_origin, wedge_ids)
+        normals = tf.gather(self.solver._wedges_normals, wedge_ids)
+        d_tx = dot((tf.gather(sources, rows[:, 1]) - origins)[:, None, :], normals)
+        d_rx = dot((tf.gather(targets, rows[:, 0]) - origins)[:, None, :], normals)
+        eps = tf.cast(self.solver.EPSILON, d_tx.dtype)
+        allowed = tf.ones([tf.shape(rows)[0]], tf.bool)
+        if case in ("both", "tx"):
+            allowed &= tf.reduce_any(d_tx > eps, axis=-1)
+        if case in ("both", "rx"):
+            allowed &= tf.reduce_any(d_rx > eps, axis=-1)
+        allowed |= tf.gather(self.solver._is_edge, wedge_ids)
+        if enabled is not None:
+            flags = tf.gather(enabled, tf.gather(self.solver._wedges_objects, wedge_ids))
+            crossed = self._is_flat_shared_wedge(wedge_ids) & self._opposite_sides(d_tx[:, 0], d_rx[:, 0])
+            allowed = tf.where(crossed, flags[:, 0] != flags[:, 1], allowed)
+        return tf.boolean_mask(rows, allowed)
+
+    def _flat_diffraction_points(self, sources, targets, wedge_ids):
+        """Return stationary points [N, 3] and finite-edge validity [N].
+
+        Keep the existing float64 formula and axial-case handling. Invalid
+        candidates are discarded by the caller before visibility tracing.
+        """
+        sources, targets = tf.cast(sources, tf.float64), tf.cast(targets, tf.float64)
+        origins = tf.cast(tf.gather(self.solver._wedges_origin, wedge_ids), tf.float64)
+        e_hat = tf.cast(tf.gather(self.solver._wedges_e_hat, wedge_ids), tf.float64)
+        lengths = tf.cast(tf.gather(self.solver._wedges_length, wedge_ids), tf.float64)
+        e_hat = tf.math.divide_no_nan(e_hat, tf.norm(e_hat, axis=-1, keepdims=True))
+        source_offsets, target_offsets = sources - origins, targets - origins
+        z_source, z_target = dot(source_offsets, e_hat), dot(target_offsets, e_hat)
+
+        def perpendicular_distance(vector):
+            squared = tf.reduce_sum(tf.square(vector), axis=-1)
+            positive = squared > 0.0
+            safe_squared = tf.where(positive, squared, tf.ones_like(squared))
+            return tf.where(positive, tf.sqrt(safe_squared), tf.zeros_like(squared))
+
+        h_source = perpendicular_distance(source_offsets - z_source[:, None] * e_hat)
+        h_target = perpendicular_distance(target_offsets - z_target[:, None] * e_hat)
+        h_sum = h_source + h_target
+        t_min = tf.math.divide_no_nan(z_source * h_target + z_target * h_source, h_sum)
+        axial_low = tf.maximum(tf.minimum(z_source, z_target), tf.zeros_like(h_sum))
+        axial_high = tf.minimum(tf.maximum(z_source, z_target), lengths)
+        axial_valid = axial_low <= axial_high
+        t_min = tf.where(h_sum > 0.0, t_min, 0.5 * (axial_low + axial_high))
+        valid = (t_min >= 0.0) & (t_min <= lengths) & ((h_sum > 0.0) | axial_valid)
+        return tf.cast(origins + t_min[:, None] * e_hat, self._rdtype), valid
+
+    @staticmethod
+    def _flat_unique_paths(link_ids, angles):
+        """Keep the last path per link with exactly matching departure/arrival angles."""
+        order = tf.range(tf.shape(link_ids)[0], dtype=tf.int32)
+        # Stable lexicographic sorting avoids a padded pairwise similarity tensor.
+        for axis in (3, 2, 1, 0):
+            order = tf.gather(order, tf.argsort(tf.gather(angles[:, axis], order), stable=True))
+        order = tf.gather(order, tf.argsort(tf.gather(link_ids, order), stable=True))
+        sorted_links, sorted_angles = tf.gather(link_ids, order), tf.gather(angles, order)
+        same = ((sorted_links[:-1] == sorted_links[1:]) &
+                tf.reduce_all(sorted_angles[:-1] == sorted_angles[1:], axis=1))
+        drop = tf.boolean_mask(order[:-1], same)
+        return tf.tensor_scatter_nd_update(tf.ones(tf.shape(link_ids), tf.bool),
+                                           drop[:, None], tf.zeros_like(drop, dtype=tf.bool))
+
+    def _pack_flat_paths(self, paths, tmp, rows, points, visible, records,
+                         deduplicate=True, path_type=Paths.DIFFRACTED, return_indices=False):
+        """Compute geometry on surviving rows, then assemble the public Paths layout."""
+        num_rx, num_tx = tf.shape(paths.targets)[0], tf.shape(paths.sources)[0]
+        input_count = tf.shape(rows)[0]
+        input_ids = tf.cast(tf.where(visible)[:, 0], tf.int32)
+        rows, points = tf.boolean_mask(rows, visible), tf.boolean_mask(points, visible)
+        incident, r1 = normalize(points - tf.gather(paths.sources, rows[:, 1]))
+        outgoing, r2 = normalize(tf.gather(paths.targets, rows[:, 0]) - points)
+        theta_t, phi_t = theta_phi_from_unit_vec(incident)
+        theta_r, phi_r = theta_phi_from_unit_vec(-outgoing)
+        link_ids = rows[:, 0] * num_tx + rows[:, 1]
+        unique = (self._flat_unique_paths(link_ids, tf.stack([theta_t, phi_t, theta_r, phi_r], axis=1))
+                  if deduplicate else tf.ones_like(link_ids, dtype=tf.bool))
+        rows, points, input_ids = [tf.boolean_mask(x, unique) for x in (rows, points, input_ids)]
+        incident, outgoing, r1, r2, theta_t, phi_t, theta_r, phi_r = [
+            tf.boolean_mask(x, unique) for x in (incident, outgoing, r1, r2, theta_t, phi_t, theta_r, phi_r)
+        ]
+        link_ids = rows[:, 0] * num_tx + rows[:, 1]
+        counts = tf.math.unsorted_segment_sum(tf.ones_like(link_ids), link_ids, num_rx * num_tx)
+        offsets = tf.cumsum(counts, exclusive=True)
+        slots = tf.range(tf.size(link_ids)) - tf.gather(offsets, link_ids)
+        indices = tf.concat([rows[:, :2], slots[:, None]], axis=1)
+        max_paths = tf.reduce_max(tf.concat([counts, tf.zeros([1], tf.int32)], axis=0))
+        shape = tf.stack([num_rx, num_tx, max_paths])
+
+        def packed(values):
+            return tf.scatter_nd(indices, values, tf.concat([shape, tf.shape(values)[1:]], axis=0))
+
+        paths.objects = tf.tensor_scatter_nd_update(tf.fill(shape, -1), indices, rows[:, 2])[None, ...]
+        paths.vertices = packed(points)[None, ...]
+        paths.mask = packed(tf.ones_like(link_ids, tf.bool))
+        paths.depth_mask = paths.objects >= 0
+        paths.path_types = tf.fill(tf.shape(paths.objects), path_type)
+        paths.theta_t, paths.phi_t = packed(theta_t), packed(phi_t)
+        paths.theta_r, paths.phi_r = packed(theta_r), packed(phi_r)
+        paths.tau = tf.tensor_scatter_nd_update(
+            -tf.ones(shape, self._rdtype), indices, (r1 + r2) / SPEED_OF_LIGHT
+        )
+        tmp.k_i = tf.stack([packed(incident), packed(outgoing)], axis=0)
+        tmp.k_r = packed(outgoing)[None, ...]
+        tmp.k_tx, tmp.k_rx = packed(incident), packed(-outgoing)
+        tmp.total_distance = packed(r1 + r2)
+
+        if records is not None:
+            mapping = tf.tensor_scatter_nd_update(tf.fill([input_count, 3], -1), input_ids[:, None], indices)
+            record_indices = tf.gather(mapping, records[0])
+            keep = record_indices[:, 0] >= 0
+            tmp.transmission_path_indices = tf.boolean_mask(record_indices, keep)
+            tmp.transmission_primitives = tf.boolean_mask(records[1], keep)
+            tmp.transmission_t = tf.boolean_mask(records[2], keep)
+            tmp.transmission_order = tf.boolean_mask(records[3], keep)
+            tmp.transmission_segments = tf.boolean_mask(records[4], keep)
+        if return_indices:
+            return paths, tmp, input_ids, indices
+        return paths, tmp
+
+    def _tracing_legacy(self, sources, targets, los_prim, diffraction, edge_diffraction, case='both',
+                transmission=False, link_candidates=None) -> Tuple[Paths, PathsTmpData]:
         
         diff_paths = Paths(sources=sources, targets=targets, scene=self._scene,
                            types=Paths.DIFFRACTED)
         diff_paths_tmp = PathsTmpData(sources, targets, self._dtype)
         diff_paths_tmp.junction_transmission = transmission
 
-        if not diffraction or (los_prim is None and not transmission):
+        if not diffraction or (link_candidates is None and los_prim is None and not transmission):
             return diff_paths, diff_paths_tmp
 
-        if los_prim is None:
+        candidate_mask = None
+        if link_candidates is not None:
+            candidate_wedges, candidate_mask = link_candidates
+            if not edge_diffraction:
+                keep = ~tf.gather(self.solver._is_edge, candidate_wedges)
+                candidate_wedges = tf.boolean_mask(candidate_wedges, keep)
+                candidate_mask = tf.boolean_mask(candidate_mask, keep, axis=2)
+        elif los_prim is None:
             candidate_wedges = tf.zeros([0], tf.int32)
         else:
             candidate_wedges = self.solver._wedges_from_primitives(los_prim, edge_diffraction)
 
-        # Keep material junctions even if candidate rays missed their faces.
+        junction_flags = None
         has_wedges = tf.shape(self.solver._wedges_objects)[0] > 0
-        if transmission and has_wedges:
+        if transmission and has_wedges and case == "both":
             array_size = tf.reduce_max(self.solver._primitives_2_objects) + 1
             _, enabled = self.solver._build_slab_properties_tensors(array_size)
 
-            all_wedges = tf.range(tf.shape(self.solver._wedges_objects)[0], dtype=tf.int32)
-            face_enabled = tf.gather(enabled, self.solver._wedges_objects)
-            mixed = tf.math.logical_xor(face_enabled[:, 0], face_enabled[:, 1])
-            junctions = tf.boolean_mask(all_wedges, self._is_flat_shared_wedge(all_wedges) & mixed)
-            candidate_wedges, _ = tf.unique(tf.concat([candidate_wedges, junctions], axis=0))
+            # Preserve the legacy junction candidates only outside env_driven.
+            if link_candidates is None:
+                all_wedges = tf.range(tf.shape(self.solver._wedges_objects)[0], dtype=tf.int32)
+                face_enabled = tf.gather(enabled, self.solver._wedges_objects)
+                mixed = face_enabled[:, 0] != face_enabled[:, 1]
+                flat = self._is_flat_shared_wedge(all_wedges)
+                junctions = tf.boolean_mask(all_wedges, flat & mixed)
+                candidate_wedges, _ = tf.unique(tf.concat([candidate_wedges, junctions], axis=0))
+                junction_flags = (tf.gather(flat, candidate_wedges), tf.gather(mixed, candidate_wedges))
+            else:
+                face_objects = tf.gather(self.solver._wedges_objects, candidate_wedges)
+                face_enabled = tf.gather(enabled, face_objects)
+                junction_flags = (
+                    self._is_flat_shared_wedge(candidate_wedges),
+                    face_enabled[:, 0] != face_enabled[:, 1],
+                )
 
-        candidate_shape = tf.stack([tf.shape(targets)[0], tf.shape(sources)[0], tf.size(candidate_wedges)])
-        diff_wedges_indices = tf.broadcast_to(candidate_wedges[None, None, :], candidate_shape)
-
-        if transmission and has_wedges:
-            origins = tf.gather(self.solver._wedges_origin, candidate_wedges)
-            normals = tf.gather(self.solver._wedges_normals[:, 0], candidate_wedges)
-            d_tx = dot(sources[:, None, :] - origins[None, :, :], normals[None, :, :])
-            d_rx = dot(targets[:, None, :] - origins[None, :, :], normals[None, :, :])
-            opposite = self._opposite_sides(d_tx[None, ...], d_rx[:, None, :])
-
-            flat_shared = self._is_flat_shared_wedge(candidate_wedges)
-            mixed = tf.gather(mixed, candidate_wedges)
-
-            # The transmitted sector currently requires exactly one transmissive face.
-            unsupported = opposite & (flat_shared & ~mixed)[None, None, :]
-            diff_wedges_indices = tf.where(unsupported, -1, diff_wedges_indices)
+        diff_wedges_indices = self._discard_obstructing_wedges_and_corners(
+            candidate_wedges, targets, sources, case=case, junction_flags=junction_flags,
+            candidate_mask=candidate_mask,
+        )
 
         # Compute the intersection points with the wedges, and discard paths
         # for which the intersection point is not on the finite wedge.
@@ -96,7 +366,8 @@ class WedgeDiffraction:
         return diff_paths, diff_paths_tmp
 
 
-    def check_obstructions(self, diff_paths, diff_paths_tmp, diffraction, case='both'):
+    def check_obstructions(self, diff_paths, diff_paths_tmp, diffraction, case='both',
+                           compact_visibility=False):
         # Discard obstructed diffracted paths
         # Only check for wedge visibility if there is at least one candidate
         # diffracted path
@@ -114,6 +385,10 @@ class WedgeDiffraction:
         if getattr(diff_paths_tmp, "junction_transmission", False) and case == "both":
             diff_wedges_indices = self.solver.solver_reflection._trace_diffraction_transmissions(
                 diff_wedges_indices, diff_vertices, sources, targets, diff_paths_tmp
+            )
+        elif compact_visibility:
+            diff_wedges_indices = self.solver._check_env_first_order_visibility(
+                sources, targets, diff_wedges_indices, diff_vertices, case
             )
         else:
             diff_wedges_indices, diff_vertices = self._check_wedges_visibility(
@@ -153,7 +428,8 @@ class WedgeDiffraction:
         return ((d_tx > eps) & (d_rx < -eps)) | ((d_tx < -eps) & (d_rx > eps))
 
     def _discard_obstructing_wedges_and_corners(self, candidate_wedges, targets,
-                                                sources, case='both'):
+                                                sources, case='both', junction_flags=None,
+                                                candidate_mask=None):
         r"""
         Discard wedges for which at least one of the source or target are
         "inside" the wedge
@@ -207,9 +483,8 @@ class WedgeDiffraction:
         u_r = targets - origins
 
         # [num_sources, num_candidate_wedges, 2]
-        sources_valid_half_space = dot(u_t, normals)
-        sources_valid_half_space = tf.greater(sources_valid_half_space,
-                    tf.fill(tf.shape(sources_valid_half_space), epsilon))
+        d_tx = dot(u_t, normals)
+        sources_valid_half_space = d_tx > epsilon
         # [num_sources, num_candidate_wedges]
         sources_valid_half_space = tf.reduce_any(sources_valid_half_space,
                                                  axis=2)
@@ -219,9 +494,8 @@ class WedgeDiffraction:
                                                   axis=0)
 
         # [num_targets, num_candidate_wedges, 2]
-        targets_valid_half_space = dot(u_r, normals)
-        targets_valid_half_space = tf.greater(targets_valid_half_space,
-                            tf.fill(tf.shape(targets_valid_half_space),epsilon))
+        d_rx = dot(u_r, normals)
+        targets_valid_half_space = d_rx > epsilon
         # [num_targets, num_candidate_wedges]
         targets_valid_half_space = tf.reduce_any(targets_valid_half_space,
                                                  axis=2)
@@ -242,6 +516,13 @@ class WedgeDiffraction:
         ### planar egdes don't obstruct
         is_edge = tf.gather(self.solver._is_edge, candidate_wedges)
         mask = tf.where(is_edge, tf.fill(tf.shape(mask), True), mask)
+        if junction_flags is not None and case == "both":
+            flat, mixed = junction_flags
+            opposite = self._opposite_sides(d_tx[None, :, :, 0], d_rx[:, None, :, 0])
+            crossed_flat = opposite & flat[None, None, :]
+            mask = tf.where(crossed_flat, mixed[None, None, :], mask)
+        if candidate_mask is not None:
+            mask &= candidate_mask
 
         # Discard paths with no valid link
         # [max_num_paths]
@@ -540,7 +821,7 @@ class WedgeDiffraction:
         return paths
 
 
-    def compute_fields(self, relative_permittivity, scattering_coefficient, paths, paths_tmp):
+    def compute_fields(self, relative_permittivity, scattering_coefficient, paths, paths_tmp, spec_paths=None, spec_paths_tmp=None):
         r"""
         Compute ordinary wedge-diffraction matrices for valid paths only.
 
@@ -605,10 +886,15 @@ class WedgeDiffraction:
             s_prime_hat, s_prime = normalize(points - sources)
             s_hat, s = normalize(targets - points)
 
+            sb_check = None
+            if self.warn_sb_side_mismatch and getattr(spec_paths_tmp, "reflection_traced", False):
+                primitives = spec_paths_tmp.reflection_primitives
+                sb_check = (indices[:, :2], spec_paths.mask, primitives)
+
             matrices = self._wedge_field_matrices(
                 wedge_idxs, normals, e_hat, n, etas, scattering,
                 s_prime_hat, s_hat, s_prime, s,
-                theta_t, phi_t, theta_r, phi_r
+                theta_t, phi_t, theta_r, phi_r, sb_check=sb_check
             )
 
             # Incident spherical spreading is applied once, as in SolverPaths.
@@ -758,7 +1044,7 @@ class WedgeDiffraction:
     def _wedge_field_matrices(
         self, wedge_idxs, normals, e_hat, n, etas, scattering,
         s_prime_hat, s_hat, s_prime, s,
-        theta_t, phi_t, theta_r, phi_r,
+        theta_t, phi_t, theta_r, phi_r, sb_check=None,
         object_idxs=None, incident_slab_coeffs=None,
     ):
         r"""
@@ -862,6 +1148,10 @@ class WedgeDiffraction:
         )
 
         phi_m, phi_p = phi - phi_prime, phi + phi_prime
+
+        if sb_check is not None:
+            self._warn_reflection_sb_side(wedge_idxs, n, phi_p, use_other_sector, *sb_check)
+        
         d_mul = -tf.cast(tf.exp(-1j * PI / 4.0), self._dtype) / tf.cast(
             2.0 * n * tf.sqrt(2.0 * PI * k) * tf.sin(beta_prime), self._dtype
         )
@@ -921,6 +1211,49 @@ class WedgeDiffraction:
         ), self._dtype)
 
         return tf.matmul(mat_to_gcs, tf.matmul(matrices, mat_from_gcs))
+
+    def _warn_reflection_sb_side(self, wedge_idxs, n, phi_p, use_other_sector,
+                                 link_indices, spec_mask, spec_primitives):
+        """Compare WD side with traced reflections at the physical face boundaries."""
+        if tf.shape(spec_primitives)[0] == 0:
+            return
+
+        # Columns follow the geometry order: face 0 (d4), face n (d3).
+        delta = tf.stack([PI - phi_p, phi_p + PI - 2.0 * n * PI], axis=-1)
+        ordinary = (n > 1.0 + 1e-5) & ~use_other_sector
+        ordinary &= ~tf.gather(self.solver._is_edge, wedge_idxs)
+        near = tf.where(ordinary[:, None] & (tf.abs(delta) < self.sb_warning_tol))
+        if tf.shape(near)[0] == 0:
+            return
+
+        rows, faces = near[:, 0], near[:, 1]
+        links = tf.gather(link_indices, rows)  # [RX, TX]
+        wedges = tf.gather(wedge_idxs, rows)
+        face_primitives = tf.gather_nd(
+            self.solver._wedges_2_primitives,
+            tf.stack([tf.cast(wedges, faces.dtype), faces], axis=-1),
+        )
+
+        single = spec_mask & (tf.reduce_sum(tf.cast(spec_primitives >= 0, tf.int32), axis=0) == 1)
+        first_primitive = tf.gather_nd(spec_primitives[0], links)
+        has_reflection = tf.reduce_any(
+            tf.gather_nd(single, links) & (first_primitive == face_primitives[:, None]),
+            axis=-1,
+        )
+
+        near_delta = tf.gather_nd(delta, near)
+        mismatch = (near_delta >= 0.0) != has_reflection
+
+        bad = tf.where(mismatch)[:, 0]
+        if tf.shape(bad)[0] > 0:
+            sample = bad[:8]
+            ids = tf.concat([links, wedges[:, None], tf.cast(faces[:, None], links.dtype)], axis=-1)
+            tf.print(
+                "WARNING: WD/reflection shadow-boundary mismatch; count =", tf.size(bad),
+                "\n[RX, TX, wedge, face (0 or 1)] =", tf.gather(ids, sample),
+                "\ndelta [rad] =", tf.gather(near_delta, sample),
+                "\nhas_reflection =", tf.gather(has_reflection, sample),
+            )
 
     def simple_compute_fields(self, wedge_idxs, s_wedge_prime_hat, s_wedge_hat, s_wedge_prime, s_wedge, mask,
                                 ell_ = None, skip_F=False, geometry_override=None):
