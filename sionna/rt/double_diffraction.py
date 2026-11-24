@@ -18,7 +18,7 @@ from .diffraction_funcs import func_G_approximated_capolino, calc_angles, invert
     my_wd_compute_fields, transition_func, slope_diffr_coef, calc_angles_concave,\
     get_wd_points, my_wd_compute_fields2,\
     slope_diffr_coef_2, slope_vertex_diffr_coef, wd_numerical_derivative, vd_numerical_derivative,\
-    slope_transition_func, LinearTEVTF, t_gfi_full_approximated_capolino
+    slope_transition_func, t_gfi_full_approximated_capolino, vertex_B_odd
 from .utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
         compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
@@ -55,6 +55,7 @@ class DoubleDiffraction:
         self.is_vw_reversed_compute_fields = True
         self.is_add_slope = False
         self.dd_mode = "all"  # 'all', "main", "slope"
+        self.sv_add_delta = True  # Local even/odd SV pole corrections.
         self.is_only_close_2_transition = True
         self.is_coef_ell_separate_in_vd = True
 
@@ -3561,10 +3562,9 @@ class DoubleDiffraction:
         d_b_ij = tf.stack(d_b, axis=-1)[:, None, :]
 
         tables = solver.obj_geom.diffraction_tables
-        transition_even = LinearTEVTF(
-            tables.file_T_ev_1, transition_func, None, case="even", real_dtype=self._rdtype
+        t_even, t_odd = tables.ev_transition(
+            tf.sqrt(a_ij), tf.sqrt(b_ij), tf.sqrt(c_ij), w
         )
-        t_even = transition_even(tf.sqrt(a_ij), tf.sqrt(b_ij), tf.sqrt(c_ij), w)
         cascaded = d_a_ij * d_b_ij * t_even
 
         soft_signs = tf.cast([1.0, 1.0, -1.0, -1.0], self._dtype)
@@ -3585,11 +3585,6 @@ class DoubleDiffraction:
                 n2, scene, tables, active, skip_F=True
             )
 
-            transition_odd = LinearTEVTF(
-                tables.file_T_ev_2, transition_func, slope_transition_func,
-                case="odd", real_dtype=self._rdtype
-            )
-            t_odd = transition_odd(tf.sqrt(a_ij), tf.sqrt(b_ij), tf.sqrt(c_ij), w)
             slope_cascaded = tf.stack(ds_a, axis=-1)[:, :, None]
             slope_cascaded = slope_cascaded * tf.stack(ds_b, axis=-1)[:, None, :] * t_odd
 
@@ -3729,11 +3724,17 @@ class DoubleDiffraction:
         return valid_pairs, valid_vertices
 
     def compute_fields_sv(self, relative_permittivity, scattering_coefficient, paths, paths_tmp):
-        """Compute shared-vertex fields on valid paths, then restore the dense layout."""
+        """Evaluate the local even/odd SV model in the existing Sionna bases."""
         solver = self.solver_paths
         dtype = solver._scene.dtype
+        rdtype = dtype.real_dtype
         wavelength = solver._scene.wavelength
-        k = 2.0 * PI / wavelength
+        k = tf.cast(2.0 * PI / wavelength, rdtype)
+
+        if self.dd_mode not in ("all", "main", "slope"):
+            raise ValueError(f"Unknown SV mode: {self.dd_mode}")
+        use_even = self.dd_mode in ("all", "main")
+        use_odd = self.dd_mode in ("all", "slope")
 
         shape = tf.shape(paths.mask)
         output_shape = tf.concat([shape, [2, 2]], axis=0)
@@ -3743,9 +3744,14 @@ class DoubleDiffraction:
 
         if tf.shape(indices)[0] == 0:
             self.delta_E = tf.zeros(shape, dtype)
-            self.c_sv = tf.zeros(shape, dtype.real_dtype)
-            self.pole_s = tf.zeros(shape, dtype.real_dtype)
+            self.delta_E_odd = tf.zeros(shape, dtype)
+            self.c_sv = tf.zeros(shape, rdtype)
+            self.pole_s = tf.zeros(shape, rdtype)
+            self.res_hard_base = tf.zeros(shape, dtype)
+            self.res_soft_base = tf.zeros(shape, dtype)
             self.res_hard = tf.zeros(shape, dtype)
+            self.res_soft = tf.zeros(shape, dtype)
+            self.sv_saddle_exist = tf.zeros(shape, tf.bool)
             return tf.zeros(output_shape, dtype)
 
         diff_point = tf.gather_nd(paths.vertices[0], indices)
@@ -3761,7 +3767,7 @@ class DoubleDiffraction:
             e_hat = tf.gather(self._wedges_e_hat, wedge_ids)
             origin = tf.gather(self._wedges_origin, wedge_ids)
 
-            # Preserve the original SV endpoint and face orientation convention.
+            # Both tangents point away from the shared vertex.
             swap = ~tf.reduce_all(tf.equal(origin, diff_point), axis=-1)
             e_hat = tf.where(swap[:, None], -e_hat, e_hat)
             n_0_hat = tf.where(swap[:, None], normals[:, 1], normals[:, 0])
@@ -3772,116 +3778,143 @@ class DoubleDiffraction:
         s_prime_hat, s_prime = normalize(diff_point - sources)
         s_hat, s = normalize(targets - diff_point)
 
-        # [N]
-        cos_alpha = tf.clip_by_value(
-            tf.reduce_sum(e_hat_w1 * e_hat_w2, axis=-1),
-            -1.0,
-            1.0,
-        ) 
-
+        cos_alpha = tf.clip_by_value(dot(e_hat_w1, e_hat_w2), -1.0, 1.0)
         alpha = tf.acos(cos_alpha)
         sin_alpha = tf.sin(alpha)
 
-        NUM_THETA = 101
-        # [NUM_THETA, N]
-        theta = tf.cast(tf.linspace(1e-2, 1.0 - 1e-2, NUM_THETA), alpha.dtype)[:, None] * (np.pi - alpha[None, ...])
+        # Keep the physical angular sector for both radial contour branches.
+        NUM_THETA = 201
+        THETA_EPS = 1e-5
+        span = tf.cast(PI, rdtype) - alpha
+        # tf.debugging.assert_greater(
+        #     span, tf.cast(2.0 * THETA_EPS, rdtype),
+        #     message="SV edges are too close to a straight angle.",
+        # )
+        # tf.debugging.assert_positive(sin_alpha, message="Degenerate SV edge angle.")
+        grid = tf.linspace(tf.cast(0.0, rdtype), tf.cast(1.0, rdtype), NUM_THETA)
+        # [NUM_THETA, N_valid]
+        theta = tf.cast(THETA_EPS, rdtype) + grid[:, None] * (
+            span[None, :] - tf.cast(2.0 * THETA_EPS, rdtype)
+        )
 
-        # ----------------------------
-        # C(theta), D(theta)
-        # ----------------------------
+        # Classification uses vertex-to-device directions, not theta samples.
+        chi_S = tf.acos(tf.clip_by_value(-dot(s_prime_hat, e_hat_w1), -1.0, 1.0))
+        chi_P = tf.acos(tf.clip_by_value(dot(s_hat, e_hat_w2), -1.0, 1.0))
+        saddle_exist = chi_S + chi_P + alpha < tf.cast(PI, rdtype)
 
-        # [N]
         g1, g2 = g1_g2_at_vertex(e_hat_w1, e_hat_w2, s_prime_hat, s_hat)
+        f1 = tf.sin(theta + alpha[None, :]) / sin_alpha[None, :]
+        f2 = tf.sin(theta) / sin_alpha[None, :]
+        C = C_theta(theta, g1[None, :], g2[None, :], alpha[None, :])
+        D = D_theta(
+            f1, f2, s_prime_hat[None, :, :], s_hat[None, :, :],
+            s_prime[None, :], s[None, :],
+            e_hat_w1[None, :, :], e_hat_w2[None, :, :],
+        )
+        J = sv_radial_endpoint(C, D, k, saddle_exist, dtype)
 
-        # [NUM_THETA, N]
-        f1 = tf.sin(theta + alpha[None, ...]) / sin_alpha[None, ...]
-        f2 = tf.sin(theta) / sin_alpha[None, ...]
+        r12_hat = f2[..., None] * e_hat_w2[None, :, :] - f1[..., None] * e_hat_w1[None, :, :]
+        r12_hat, _ = normalize(r12_hat)
 
-        # [NUM_THETA, N]
-        C = C_theta(theta, g1[None, ...], g2[None, ...], alpha[None, ...])
-        D = D_theta(f1, f2, s_prime_hat[None, ...], s_hat[None, ...], s_prime[None, ...], s[None, ...], e_hat_w1[None, ...], e_hat_w2[None, ...])
+        phi1_prime, phi12, beta1_prime, beta1 = calc_angles(
+            n_0_hat_1[None, :, :], e_hat_w1[None, :, :],
+            s_prime_hat[None, :, :], r12_hat,
+        )
+        phi12_prime, phi2, beta2_prime, beta2 = calc_angles(
+            n_0_hat_2[None, :, :], e_hat_w2[None, :, :],
+            r12_hat, s_hat[None, :, :],
+        )
 
-        # [N]
-        saddle_exist = tf.reduce_any(C < 0.0, axis=0)
-        C = tf.abs(C)
-        # [N]
-        sign = tf.where(saddle_exist, -1.0, 1.0)
+        # Map the common-face 2*pi representation to zero without moving it.
+        phi12 = tf.where(
+            tf.experimental.numpy.isclose(phi12, 2.0 * PI, atol=1e-2),
+            tf.zeros_like(phi12), phi12,
+        )
+        phi12_prime = tf.where(
+            tf.experimental.numpy.isclose(phi12_prime, 2.0 * PI, atol=1e-2),
+            tf.zeros_like(phi12_prime), phi12_prime,
+        )
+        # Retain small transverse angles on the tight float32 theta grid.
+        # acos(dot) can otherwise round beta to exactly zero or pi.
+        def elevation(e_hat, direction):
+            transverse = cross(e_hat, direction)
+            sin_beta = tf.sqrt(tf.reduce_sum(transverse**2, axis=-1))
+            return tf.math.atan2(sin_beta, dot(e_hat, direction))
 
-        # [NUM_THETA, N, 3]
-        r12_hat = f2[..., None] * e_hat_w2[None, ...] - f1[..., None] * e_hat_w1[None, ...]
-        r12_hat, _ = normalize(r12_hat)    
+        beta1_prime = elevation(e_hat_w1[None, :, :], s_prime_hat[None, :, :])
+        beta1 = elevation(e_hat_w1[None, :, :], r12_hat)
+        beta2_prime = elevation(e_hat_w2[None, :, :], r12_hat)
+        beta2 = elevation(e_hat_w2[None, :, :], s_hat[None, :, :])
+        u1 = solver.vertex_diffraction._get_param_u(beta1_prime, beta1)
+        u2 = solver.vertex_diffraction._get_param_u(beta2_prime, beta2)
 
-        # [NUM_THETA, N]
-        phi1_prime, phi12, beta1_prime, beta1 = calc_angles(n_0_hat_1[None, ...], e_hat_w1[None, ...], s_prime_hat[None, ...], r12_hat)
-        phi12_prime, phi2, beta2_prime, beta2 = calc_angles(n_0_hat_2[None, ...], e_hat_w2[None, ...], r12_hat, s_hat[None, ...])
-
-
-        phi12 = tf.where(tf.experimental.numpy.isclose(phi12, 2*PI, atol=1e-2), 1e-3*tf.ones_like(phi12), phi12)
-        phi12_prime = tf.where(tf.experimental.numpy.isclose(phi12_prime, 2*PI, atol=1e-2), 1e-3*tf.ones_like(phi12_prime), phi12_prime)
-
-        u1 = self.solver_paths.vertex_diffraction._get_param_u(beta1_prime, beta1)
-        u2 = self.solver_paths.vertex_diffraction._get_param_u(beta2_prime, beta2)
-
-        # [NUM_THETA, N]
-        b_signed = C * tf.sqrt(k) / (2.0 * tf.sqrt(D))
-        T = transition_func(b_signed**2)
-
-
-        G1 = G_full_hard(phi12, phi1_prime, u1, n1)
-        G2 = G_full_hard(phi2, phi12_prime, u2, n2)
-        G_hard = tf.cast(G1 * G2, dtype)
-
-        coef = 1.0 / (tf.cast(1j, dtype) * tf.cast(k * C, dtype))
-
-        amp = (
-            -2.0
-            * G_hard
-            * coef
-            * T
+        # Preserve the original normalization and downstream propagation phase.
+        radial_amp = (
+            -tf.cast(2.0, dtype) * J
             * tf.cast(wavelength, dtype)
-            * tf.cast(4*PI / wavelength, dtype)
-            / tf.cast(4.0 * PI * s_prime[None, ...], dtype)
-            / tf.cast(4.0 * PI * s[None, ...], dtype)
+            * tf.cast(4.0 * PI / wavelength, dtype)
+            / tf.cast(4.0 * PI * s_prime[None, :], dtype)
+            / tf.cast(4.0 * PI * s[None, :], dtype)
             / tf.cast(4.0 * PI, dtype)
+            / tf.cast(sin_alpha[None, :], dtype)
         )
+        res_hard_base = tf.zeros_like(s_prime, dtype=dtype)
+        res_soft_base = tf.zeros_like(s_prime, dtype=dtype)
 
-        amp = tf.where(tf.math.is_nan(tf.abs(amp)), tf.zeros_like(amp), amp)
+        if use_even:
+            G1 = G_full_hard(phi12, phi1_prime, u1, n1)
+            G2 = G_full_hard(phi2, phi12_prime, u2, n2)
+            res_hard_base = trapz_axis0(tf.cast(G1 * G2, dtype) * radial_amp, theta)
 
-        integrand = amp / tf.cast(sin_alpha, dtype)
+        if use_odd:
+            G1_odd = G_full_odd_soft(phi1_prime, phi12, u1, n1, dtype)
+            G2_odd = G_full_odd_soft(phi2, phi12_prime, u2, n2, dtype)
+            # Match EE slope signs for two outward coplanar SV tangents.
+            # Keep both u parameters in calc_angles' native convention.
+            res_soft_base = trapz_axis0(-G1_odd * G2_odd * radial_amp, theta)
 
-        # integrate over theta-axis
-        # [N]
-        res_hard = trapz_axis0(integrand, tf.cast(theta, dtype))
+        delta_even = tf.zeros_like(s_prime, dtype=dtype)
+        delta_odd = tf.zeros_like(s_prime, dtype=dtype)
+        c = tf.zeros_like(s_prime)
+        pole_s = tf.zeros_like(s_prime)
+        if self.sv_add_delta:
+            delta_even, delta_odd, c, pole_s = self._compute_sv_delta_flat(
+                k, s_prime, s, s_prime_hat, s_hat, e_hat_w1, e_hat_w2,
+                sin_alpha, cos_alpha, phi1_prime[0], phi2[0],
+                phi12[0], phi12_prime[0], n1, n2, dtype,
+                saddle_exist=saddle_exist,
+            )
+        if not use_even:
+            delta_even = tf.zeros_like(delta_even)
+        if not use_odd:
+            delta_odd = tf.zeros_like(delta_odd)
 
-        res_hard *= tf.cast(sign, dtype)
+        res_hard = res_hard_base + delta_even
+        res_soft = res_soft_base + delta_odd
 
+        # Dense diagnostics use the same path layout as paths.mask.
+        self.res_hard_base = tf.scatter_nd(indices, res_hard_base, shape)
+        self.res_soft_base = tf.scatter_nd(indices, res_soft_base, shape)
+        self.delta_E = tf.scatter_nd(indices, delta_even, shape)
+        self.delta_E_odd = tf.scatter_nd(indices, delta_odd, shape)
+        self.res_hard = tf.scatter_nd(indices, res_hard, shape)
+        self.res_soft = tf.scatter_nd(indices, res_soft, shape)
+        self.c_sv = tf.scatter_nd(indices, c, shape)
+        self.pole_s = tf.scatter_nd(indices, pole_s, shape)
+        self.sv_saddle_exist = tf.scatter_nd(indices, saddle_exist, shape)
 
-
-        delta_E, c, pole_s = self._compute_sv_delta_flat(
-            k, s_prime, s, s_prime_hat, s_hat, e_hat_w1, e_hat_w2,
-            sin_alpha, cos_alpha, phi1_prime[0], phi2[0], phi12[0], phi12_prime[0],
-            n1, n2, dtype,
-        )
-        res_hard += delta_E
-
-        # self.delta_E = tf.scatter_nd(indices, delta_E, shape)
-        # self.c_sv = tf.scatter_nd(indices, c, shape)
-        # self.pole_s = tf.scatter_nd(indices, pole_s, shape)
-        # self.res_hard = tf.scatter_nd(indices, res_hard, shape)
-
-        mat_t = tf.linalg.diag(tf.stack([res_hard, tf.zeros_like(res_hard)], axis=-1))
+        mat_t = tf.linalg.diag(tf.stack([res_hard, res_soft], axis=-1))
         theta_t = tf.gather_nd(paths.theta_t, indices)
         phi_t = tf.gather_nd(paths.phi_t, indices)
         theta_r = tf.gather_nd(paths.theta_r, indices)
         phi_r = tf.gather_nd(paths.phi_r, indices)
-
         phi1_prime_hat, _ = normalize(cross(s_prime_hat, e_hat_w1))
         beta1_prime_hat = cross(phi1_prime_hat, s_prime_hat)
         phi2_hat, _ = normalize(-cross(s_hat, e_hat_w2))
         beta2_hat = cross(phi2_hat, s_hat)
-
         mat_t = solver.convert_mat_t(
-            mat_t, tf.ones_like(s_prime, dtype=tf.bool), theta_t, phi_t, theta_r, phi_r,
+            mat_t, tf.ones_like(s_prime, dtype=tf.bool),
+            theta_t, phi_t, theta_r, phi_r,
             phi1_prime_hat, beta1_prime_hat, phi2_hat, beta2_hat,
         )
         return tf.scatter_nd(indices, mat_t, output_shape)
@@ -3889,42 +3922,59 @@ class DoubleDiffraction:
     def _compute_sv_delta_flat(
         self, k, s_prime, s, s_prime_hat, s_hat, e_hat_w1, e_hat_w2,
         sin_alpha, cos_alpha, phi1_prime, phi2, q1, q2, n1, n2, dtype,
+        saddle_exist=None,
     ):
-        """Evaluate the hard-polarization correction on admissible SV rows."""
+        """Local one-pole-pair corrections; returns even, odd, signed c and s.
+
+        This is the existing asymptotic correction, continued to signed c<0.
+        It is not a full four-pair uniformization. Exact joint pole limits
+        remain outside its validity; those rows receive no correction.
+        """
+        output_rdtype = dtype.real_dtype
+        shape = tf.shape(s_prime)
+        # Evaluate endpoint differences in double precision on the flat batch.
+        s_prime, s = tf.cast(s_prime, tf.float64), tf.cast(s, tf.float64)
+        s_prime_hat = tf.cast(s_prime_hat, tf.float64)
+        s_hat = tf.cast(s_hat, tf.float64)
+        e_hat_w1 = tf.cast(e_hat_w1, tf.float64)
+        e_hat_w2 = tf.cast(e_hat_w2, tf.float64)
+        sin_alpha, cos_alpha = tf.cast(sin_alpha, tf.float64), tf.cast(cos_alpha, tf.float64)
+        phi1_prime, phi2 = tf.cast(phi1_prime, tf.float64), tf.cast(phi2, tf.float64)
+        q1, q2 = tf.cast(q1, tf.float64), tf.cast(q2, tf.float64)
+        n1, n2, k = tf.cast(n1, tf.float64), tf.cast(n2, tf.float64), tf.cast(k, tf.float64)
+
         pS = -s_prime * dot(s_prime_hat, e_hat_w1)
         pP = s * dot(s_hat, e_hat_w2)
         hS = tf.sqrt(tf.maximum(s_prime**2 - pS**2, 0.0))
         hP = tf.sqrt(tf.maximum(s**2 - pP**2, 0.0))
-
         hS_star = pS * sin_alpha + hS * cos_alpha
         hP_star = pP * sin_alpha + hP * cos_alpha
         p_star = pP * cos_alpha - hP * sin_alpha
         Phi_s = tf.sqrt((pS - p_star)**2 + (hS + hP_star)**2)
         Phi_v = s_prime + s
 
-        # Select rows before dividing by projected heights or evaluating GFI.
         valid = (hS > 0.0) & (hP > 0.0) & (hS_star > 0.0) & (hP_star > 0.0) & (Phi_s > 0.0)
         rows = tf.cast(tf.where(valid), tf.int32)
-        shape = tf.shape(s_prime)
         if tf.shape(rows)[0] == 0:
-            return tf.zeros(shape, dtype), tf.zeros_like(s_prime), tf.zeros_like(s_prime)
+            zero = tf.zeros(shape, dtype)
+            return zero, zero, tf.zeros(shape, output_rdtype), tf.zeros(shape, output_rdtype)
 
         def select(*values):
             return tuple(tf.gather_nd(value, rows) for value in values)
 
         pS, pP, hS, hP, hS_star, hP_star, Phi_s, Phi_v = select(
-            pS, pP, hS, hP, hS_star, hP_star, Phi_s, Phi_v
+            pS, pP, hS, hP, hS_star, hP_star, Phi_s, Phi_v,
         )
         sin_alpha, cos_alpha, phi1_prime, phi2, q1, q2, n1, n2 = select(
-            sin_alpha, cos_alpha, phi1_prime, phi2, q1, q2, n1, n2
+            sin_alpha, cos_alpha, phi1_prime, phi2, q1, q2, n1, n2,
         )
+        selected_saddle = None if saddle_exist is None else tf.gather_nd(saddle_exist, rows)
 
         kap = sin_alpha / (1.0 + cos_alpha)
         TS = tf.exp(tf.asinh(pS / hS))
         TP = tf.exp(-tf.asinh(pP / hP))
         f0 = TS - kap * TS * TP - kap - TP
         c = -f0 * tf.sqrt(k * hS * hP / (TS * TP * (1.0 + kap**2) * (Phi_v + Phi_s)))
-
         w = tf.sqrt(hS * hP / (hS_star * hP_star))
         q1 = tf.where(tf.abs(q1) <= tf.abs(q1 - n1 * PI), tf.zeros_like(q1), n1 * PI)
         q2 = tf.where(tf.abs(q2) <= tf.abs(q2 - n2 * PI), tf.zeros_like(q2), n2 * PI)
@@ -3934,17 +3984,63 @@ class DoubleDiffraction:
         b_bar = 2.0 * alpha2 * tf.cos((phi2 - q2) / 2.0)
         pole_s = w * tf.abs(a_bar) + tf.abs(b_bar)
         sigma = tf.sign(a_bar * b_bar)
-
-        T_gfi = t_gfi_full_approximated_capolino(c**2, pole_s**2, self.obj_geom.diffraction_tables)
-        F_c = transition_func(c**2)
-        N = -8.0 * PI / (4.0 * PI)**3
-        delta_E = (
-            tf.cast(2.0 * PI * N * sigma / Phi_v, dtype)
-            / tf.cast(1j, dtype)
-            * tf.cast(pole_s / (c * (c**2 + pole_s**2)), dtype)
-            * (T_gfi - F_c)
+        # Each odd pole residue changes sign when its reference face changes.
+        odd_pole_sign = (
+            tf.sign(tf.sin((phi1_prime - q1) / 2.0))
+            * tf.sign(tf.sin((phi2 - q2) / 2.0))
         )
-        return tuple(tf.scatter_nd(rows, value, shape) for value in (delta_E, c, pole_s))
+
+        # Evaluate GFI only on admissible nonzero arguments.
+        # Use the analytic one-sided c->0 limit at fixed pole_s>0.
+        nonzero_s = pole_s > 0.0
+        regular = nonzero_s & (tf.abs(c) > 1e-6)
+        reg_rows = tf.cast(tf.where(regular), tf.int32)
+        near_rows = tf.cast(tf.where(nonzero_s & ~regular), tf.int32)
+        base = tf.zeros(tf.shape(c), tf.complex128)
+        N = tf.cast(-8.0 * PI / (4.0 * PI)**3, tf.float64)
+
+        if tf.shape(reg_rows)[0] > 0:
+            cr, sr, vr = tuple(tf.gather_nd(v, reg_rows) for v in (c, pole_s, Phi_v))
+            T_gfi = tf.cast(t_gfi_full_approximated_capolino(
+                cr**2, sr**2, self.obj_geom.diffraction_tables,
+            ), tf.complex128)
+            F_c = tf.cast(transition_func(cr**2), tf.complex128)
+            value = (
+                tf.cast(2.0 * PI * N / vr, tf.complex128)
+                / tf.cast(1j, tf.complex128)
+                * tf.cast(sr / (cr * (cr**2 + sr**2)), tf.complex128)
+                * (T_gfi - F_c)
+            )
+            base = tf.tensor_scatter_nd_update(base, reg_rows, value)
+
+        if tf.shape(near_rows)[0] > 0:
+            cn, sn, vn = tuple(tf.gather_nd(v, near_rows) for v in (c, pole_s, Phi_v))
+            if selected_saddle is None:
+                side = tf.where(cn < 0.0, -tf.ones_like(cn), tf.ones_like(cn))
+            else:
+                inside = tf.gather_nd(selected_saddle, near_rows)
+                side = tf.where(inside, -tf.ones_like(cn), tf.ones_like(cn))
+            factor = tf.sqrt(tf.cast(PI, tf.float64)) * tf.exp(
+                tf.complex(tf.cast(0.0, tf.float64), tf.cast(PI / 4.0, tf.float64))
+            )
+            value = (
+                tf.cast(2.0 * PI * N * side / vn, tf.complex128)
+                / tf.cast(1j, tf.complex128)
+                * factor
+                * (tf.cast(transition_func(sn**2), tf.complex128) - 1.0)
+                / tf.cast(sn, tf.complex128)
+            )
+            base = tf.tensor_scatter_nd_update(base, near_rows, value)
+
+        delta_even = tf.cast(tf.cast(sigma, tf.complex128) * base, dtype)
+        # Include both the transport sign and the two odd pole-residue signs.
+        delta_odd = tf.cast(-tf.cast(odd_pole_sign, tf.complex128) * base, dtype)
+        return (
+            tf.scatter_nd(rows, delta_even, shape),
+            tf.scatter_nd(rows, delta_odd, shape),
+            tf.scatter_nd(rows, tf.cast(c, output_rdtype), shape),
+            tf.scatter_nd(rows, tf.cast(pole_s, output_rdtype), shape),
+        )
 
 
 
@@ -4398,6 +4494,45 @@ def G_full_hard(phi, phip, u, n):
     )
 
     return term1 + term2
+
+def sv_radial_endpoint(C, D, k, saddle_exist, dtype):
+    """Quadratic radial endpoint branch, with a finite C=0 limit.
+
+    C, D: [num_theta, N_valid]; saddle_exist: [N_valid].
+    The inside branch is the oriented negative radial continuation.
+    """
+    tf.debugging.assert_positive(D, message="SV radial model requires D > 0.")
+    k = tf.cast(k, C.dtype)
+    eps_C = tf.cast(1e-7 if C.dtype == tf.float32 else 1e-14, C.dtype)
+    small = tf.abs(C) <= eps_C
+    safe_C = tf.where(small, tf.ones_like(C), C)
+    b_squared = k * C**2 / (4.0 * D)
+    F_b = tf.cast(transition_func(b_squared), dtype)
+    S_r = tf.cast(tf.sqrt(PI / (k * D)), dtype) * tf.exp(
+        tf.complex(tf.zeros_like(b_squared), b_squared - tf.cast(PI / 4.0, C.dtype))
+    )
+    J = F_b / tf.cast(tf.complex(tf.zeros_like(C), k * safe_C), dtype)
+    subtract_full = saddle_exist[None, :] & (C > eps_C)
+    J -= tf.where(subtract_full, S_r, tf.zeros_like(S_r))
+    side = tf.where(saddle_exist, -tf.ones_like(C[0]), tf.ones_like(C[0]))
+    limit = tf.cast(0.5 * side[None, :], dtype) * S_r
+    return tf.where(small, limit, J)
+
+
+def G_full_odd_soft(phi_external, phi_internal, u, n, dtype):
+    """Soft odd angular sum in the native outward SV edge convention.
+
+    This is the [+,+,-,-] mask in the EE Phi1_pq/Phi2_rs order.
+    The transport sign of the product is applied in compute_fields_sv.
+    """
+    return (
+        vertex_B_odd(PI + phi_external + phi_internal, u, n, dtype)
+        + vertex_B_odd(PI + phi_external - phi_internal, u, n, dtype)
+        - vertex_B_odd(PI - phi_external + phi_internal, u, n, dtype)
+        - vertex_B_odd(PI - phi_external - phi_internal, u, n, dtype)
+    )
+
+
 
 def trapz_axis0(y, x):
     """

@@ -265,9 +265,18 @@ class VertexDiffraction:
             allowed &= tf.reduce_any(d_tx > eps, axis=1)
         if case in ("both", "rx"):
             allowed &= tf.reduce_any(d_rx > eps, axis=1)
+        wd = solver.solver_wedge_diffraction
+        flat = wd._is_flat_shared_wedge(wedges)
+        # Keep the real n=1 junction on both reflecting sides. Only the
+        # existing crossed-sheet branch may introduce knife-edge transmission.
+        if case == "both":
+            allowed = tf.where(flat, wd._same_sides(d_tx[:, 0], d_rx[:, 0]), allowed)
+        elif case == "tx":
+            allowed = tf.where(flat, tf.abs(d_tx[:, 0]) > eps, allowed)
+        else:
+            allowed = tf.where(flat, tf.abs(d_rx[:, 0]) > eps, allowed)
         if enabled is not None:
-            wd = solver.solver_wedge_diffraction
-            crossed = wd._is_flat_shared_wedge(wedges) & wd._opposite_sides(d_tx[:, 0], d_rx[:, 0])
+            crossed = flat & wd._opposite_sides(d_tx[:, 0], d_rx[:, 0])
             face_flags = tf.gather(enabled, tf.gather(solver._wedges_objects, wedges))
             allowed = tf.where(crossed, face_flags[:, 0] != face_flags[:, 1], allowed)
         is_edge = tf.gather(solver._is_edge, wedges)
@@ -748,7 +757,8 @@ class VertexDiffraction:
 
         return paths
 
-    def compute_fields2(self, relative_permittivity, scattering_coefficient, paths, paths_tmp):
+    def compute_fields2(self, relative_permittivity, scattering_coefficient, paths, paths_tmp,
+                        diff_paths=None, diff_paths_tmp=None):
         shape = tf.shape(paths.objects[0])  # [targets, sources, vertex_paths]
         indices = tf.cast(tf.where(paths.vertex_wedge_mask & paths.mask[..., None]), tf.int32)
         path_indices = indices[:, :3]
@@ -798,6 +808,13 @@ class VertexDiffraction:
         def compute_rows(rows, metal_knife_edge):
             selected_wedges = tf.gather_nd(wedge_idxs, rows)
             selected_points = tf.gather_nd(points, rows)
+            sb_check = None
+            if (getattr(self.solver_paths, "warn_sb_side_mismatch", False)
+                    and diff_paths is not None
+                    and getattr(diff_paths_tmp, "sb_wd_rows", None) is not None):
+                selected_paths = tf.gather_nd(path_indices, rows)
+                selected_vertices = tf.gather_nd(paths.objects[0], selected_paths)
+                sb_check = (selected_paths[:, :2], selected_vertices, diff_paths, diff_paths_tmp)
             etas, scattering = self._vertex_edge_materials(
                 relative_permittivity, scattering_coefficient, selected_wedges, selected_points
             )
@@ -807,7 +824,7 @@ class VertexDiffraction:
                 etas, scattering,
                 tf.gather_nd(theta_t, rows), tf.gather_nd(phi_t, rows),
                 tf.gather_nd(theta_r, rows), tf.gather_nd(phi_r, rows),
-                metal_knife_edge=metal_knife_edge,
+                metal_knife_edge=metal_knife_edge, sb_check=sb_check,
             )
 
         if tf.shape(ordinary_rows)[0] > 0:
@@ -842,16 +859,19 @@ class VertexDiffraction:
         return etas, scattering
 
     def _vertex_edge_matrices(self, wedge_idxs, points, sources, targets, etas, scattering,
-                            theta_t, phi_t, theta_r, phi_r, metal_knife_edge=False):
+                            theta_t, phi_t, theta_r, phi_r, metal_knife_edge=False,
+                            sb_check=None):
         wavelength = self.solver_paths._scene.wavelength
         k = 2.0 * PI / wavelength
 
-        e_hat, n_0_hat, n_n_hat, wedge_n = self._vertex_edge_geometry(wedge_idxs, points)
+        swap = self._vertex_edge_swap(wedge_idxs, points)
+        e_hat, n_0_hat, n_n_hat, wedge_n = self._vertex_edge_geometry(
+            wedge_idxs, points, swap=swap
+        )
 
         object_idxs = tf.gather(self.solver_paths._wedges_objects, wedge_idxs)
 
         # Match material ordering to the endpoint orientation exactly once.
-        swap = self._vertex_edge_swap(wedge_idxs, points)
         etas = tf.where(swap[:, None], tf.reverse(etas, axis=[1]), etas)
         scattering = tf.where(swap[:, None], tf.reverse(scattering, axis=[1]), scattering)
         object_idxs = tf.where(swap[:, None], tf.reverse(object_idxs, axis=[1]), object_idxs)
@@ -921,6 +941,9 @@ class VertexDiffraction:
         phi_prime = tf.where(wedge_n < 1.0, phi_prime_c, phi_prime)
         phi = tf.where(wedge_n < 1.0, phi_c, phi)
 
+        if sb_check is not None:
+            self._warn_wedge_sb_side(wedge_idxs, swap, beta_prime, beta, *sb_check)
+
         e_i_s_0, e_i_p_0, e_r_s_0, e_r_p_0 = compute_field_unit_vectors(
             s_prime_hat, s_hat, n_0_hat, self.solver_paths.EPSILON
         )
@@ -970,12 +993,7 @@ class VertexDiffraction:
         ell = tf.maximum(ell, tf.zeros_like(ell))
 
         phi_m, phi_p = phi - phi_prime, phi + phi_prime
-        param_a = tf.stack([
-            self._get_tip_a_plus(phi_m, wedge_n, k, ell),
-            self._get_tip_a_minus(phi_m, wedge_n, k, ell),
-            self._get_tip_a_plus(phi_p, wedge_n, k, ell),
-            self._get_tip_a_minus(phi_p, wedge_n, k, ell),
-        ], axis=-1)
+        param_a = self._get_tip_a_all(phi_m, phi_p, wedge_n, k, ell)
 
         # coefficients, func_B, (_, gfi) = self._get_coefs_D2(wedge_n, param_a, param_b, param_u, phi_prime, phi)
         if self.use_stable_sb:
@@ -1037,6 +1055,123 @@ class VertexDiffraction:
         ), self._dtype)
         mat_t = tf.matmul(mat_to_gcs, tf.matmul(mat_t, mat_from_gcs))
         return self._clear_vertex_edge_nan(mat_t)
+
+    @staticmethod
+    def _lookup_sb_wedge_rows(query_rows, candidate_rows, num_sources, num_wedges):
+        """Match [rx, tx, wedge] rows without a pairwise comparison tensor.
+
+        Return one candidate-row index per query, or -1 if the candidate
+        was not traced. Duplicate candidate keys have identical endpoint
+        geometry, so the first matching row suffices for this diagnostic.
+        """
+        if tf.shape(candidate_rows)[0] == 0:
+            return tf.fill([tf.shape(query_rows)[0]], tf.cast(-1, tf.int32))
+
+        def keys(rows):
+            rows = tf.cast(rows, tf.int64)
+            return ((rows[:, 0] * tf.cast(num_sources, tf.int64) + rows[:, 1])
+                    * tf.cast(num_wedges, tf.int64) + rows[:, 2])
+
+        candidate_keys = keys(candidate_rows)
+        query_keys = keys(query_rows)
+        order = tf.argsort(candidate_keys, stable=True)
+        sorted_keys = tf.gather(candidate_keys, order)
+        positions = tf.searchsorted(sorted_keys, query_keys, side="left")
+        safe_positions = tf.minimum(positions, tf.shape(sorted_keys)[0] - 1)
+        found = ((positions < tf.shape(sorted_keys)[0])
+                 & (tf.gather(sorted_keys, safe_positions) == query_keys))
+        return tf.where(found, tf.gather(order, safe_positions), -tf.ones_like(positions))
+
+    def _warn_wedge_sb_side(self, wedge_idxs, swap, beta_prime, beta,
+                           link_indices, vertex_idxs, diff_paths, diff_paths_tmp):
+        """Compare the VD cone side with WD's recorded finite-edge decision.
+
+        Tangents used for beta point away from the current vertex. Hence
+        beta_prime - beta > 0 predicts a stationary point on that half-line.
+        Recorded WD coordinates use the original origin-to-end tangent.
+        Only candidates actually evaluated by WD are compared. Occlusion,
+        candidate omission and path deduplication are not side mismatches.
+        The joint GO/WD/VD limit is not diagnosed by this endpoint check.
+        """
+        solver = self.solver_paths
+        if not getattr(solver, "warn_sb_side_mismatch", False):
+            return
+        recorded_rows = getattr(diff_paths_tmp, "sb_wd_rows", None)
+        if recorded_rows is None or tf.shape(recorded_rows)[0] == 0:
+            return
+
+        delta = beta_prime - beta
+        # The axial case has no unique isolated WD stationary point.
+        axial = ((tf.abs(tf.sin(beta)) <= tf.cast(1e-6, beta.dtype))
+                 | (tf.abs(tf.sin(beta_prime)) <= tf.cast(1e-6, beta_prime.dtype)))
+        near = tf.cast(tf.where(
+            tf.math.is_finite(delta) & (tf.abs(delta) < solver.sb_warning_tol)
+            & (delta != 0.0) & ~axial
+        )[:, 0], tf.int32)
+        if tf.size(near) == 0:
+            return
+
+        queries = tf.concat([
+            tf.gather(link_indices, near),
+            tf.cast(tf.gather(wedge_idxs, near)[:, None], link_indices.dtype),
+        ], axis=-1)
+        num_sources = tf.shape(diff_paths.sources)[0]
+        num_wedges = tf.shape(solver._wedges_origin)[0]
+        matched = self._lookup_sb_wedge_rows(queries, recorded_rows, num_sources, num_wedges)
+        found = matched >= 0
+        near = tf.boolean_mask(near, found)
+        queries = tf.boolean_mask(queries, found)
+        matched = tf.boolean_mask(matched, found)
+        if tf.size(near) == 0:
+            return
+
+        t = tf.gather(diff_paths_tmp.sb_wd_stationary_t, matched)
+        length = tf.cast(tf.gather(solver._wedges_length, queries[:, 2]), t.dtype)
+        at_end = tf.gather(swap, near)
+        from_vertex = tf.where(at_end, length - t, t)
+        other_endpoint_margin = tf.where(at_end, t, length - t)
+        expected = tf.gather(delta, near) > 0.0
+        traced = from_vertex >= 0.0
+        # Do not compare with a rejection caused by the OTHER endpoint.
+        # Exact boundary values are left to a future one-sided convention.
+        comparable = (tf.math.is_finite(from_vertex) & (from_vertex != 0.0)
+                      & (length > 0.0) & (other_endpoint_margin >= 0.0))
+        bad = tf.cast(tf.where(comparable & (expected != traced))[:, 0], tf.int32)
+        if tf.size(bad) == 0:
+            return
+
+        sample = bad[:8]
+        selected = tf.gather(near, sample)
+        sample_queries = tf.gather(queries, sample)
+        # Final presence is context only, not the criterion for a mismatch.
+        final_indices = tf.cast(tf.where(
+            diff_paths.mask & (diff_paths.objects[0] >= 0)
+        ), tf.int32)
+        final_rows = tf.concat([
+            final_indices[:, :2],
+            tf.cast(tf.gather_nd(diff_paths.objects[0], final_indices)[:, None], tf.int32),
+        ], axis=-1)
+        has_final_wd = self._lookup_sb_wedge_rows(
+            sample_queries, final_rows, num_sources, num_wedges
+        ) >= 0
+        ids = tf.concat([
+            tf.gather(link_indices, selected),
+            tf.cast(tf.gather(vertex_idxs, selected)[:, None], link_indices.dtype),
+            tf.cast(tf.gather(wedge_idxs, selected)[:, None], link_indices.dtype),
+            tf.cast(tf.gather(swap, selected)[:, None], link_indices.dtype),
+        ], axis=-1)
+        tf.print(
+            "WARNING: VD/WD shadow-boundary side mismatch; count =", tf.size(bad),
+            "\n[RX, TX, vertex, wedge, endpoint (0=origin, 1=end)] =", ids,
+            "\nbeta_prime - beta [rad] =", tf.gather(delta, selected),
+            "\nWD stationary distance from vertex [m] =", tf.gather(from_vertex, sample),
+            "\nVD expects inside =", tf.gather(expected, sample),
+            "\nWD endpoint inside =", tf.gather(traced, sample),
+            "\nWD finite-edge valid =", tf.gather(
+                diff_paths_tmp.sb_wd_finite, tf.gather(matched, sample)
+            ),
+            "\nhas_final_wd =", has_final_wd,
+        )
 
     def _vertex_sb_terms(self, k, s_prime, s, beta_prime, beta, n,
                          a, b, u, phi_m, phi_p):
@@ -1643,21 +1778,28 @@ class VertexDiffraction:
         return d1, d2, d3, d4
 
     def _get_coefs_D2(self, wedge_n, param_a, param_b, param_u, phi1_rad, phi2_rad, skip_F=False):
-        # param_a: [..., 4]
+        """Evaluate all four VD coefficients on the trailing axis.
+
+        ``param_a`` and ``param_b`` have shape [..., 4]; angular inputs
+        have shape [...]. Preserve the legacy tuple return structure.
+        """
 
         phi_m = phi2_rad - phi1_rad
         phi_p = phi2_rad + phi1_rad
-
-        # _param_b = tf.repeat(param_b[..., None], 4, axis=-1)
+        Phi = tf.stack([PI + phi_m, PI - phi_m, PI + phi_p, PI - phi_p], axis=-1)
         _t_gfi = t_gfi_full_approximated_capolino(param_b, param_a, self.obj_geom.diffraction_tables)
 
+        # Broadcast u and n: the shared hyperbolic factor is computed once.
+        func_B = tf.cast(self._get_func_B(
+            Phi, param_u[..., None], wedge_n[..., None]
+        ), self._dtype)
+        coefficients = _t_gfi * func_B
 
-        D1, func_B1 = self._coef_D_plus2(wedge_n, phi_m, param_u, _t_gfi[..., 0])
-        D2, func_B2 = self._coef_D_minus2(wedge_n, phi_m, param_u, _t_gfi[..., 1])
-        D3, func_B3 = self._coef_D_plus2(wedge_n, phi_p, param_u, _t_gfi[..., 2])
-        D4, func_B4 = self._coef_D_minus2(wedge_n, phi_p, param_u, _t_gfi[..., 3])
-
-        return (D1, D2, D3, D4), (func_B1, func_B2, func_B3, func_B4), (param_b, _t_gfi)
+        return (
+            tuple(tf.unstack(coefficients, num=4, axis=-1)),
+            tuple(tf.unstack(func_B, num=4, axis=-1)),
+            (param_b, _t_gfi),
+        )
 
     def _coef_D_plus2(self, wedge_n, Phi, param_u, t_gfi):
         func_B = tf.complex(self._get_func_B(PI + Phi, param_u, wedge_n), tf.cast(0.0, self._rdtype))
@@ -1679,6 +1821,20 @@ class VertexDiffraction:
 
     #     return k * ell * tmp
 
+    def _get_tip_a_all(self, phi_m, phi_p, n, k, ell):
+        """Return transition parameters [..., 4] in D1, D2, D3, D4 order.
+
+        Use the same squared-sine expression as the scalar helpers near SB.
+        Round is odd, so the minus terms use the same formula as the plus
+        terms after reversing their angular numerator.
+        """
+        Phi = tf.stack([PI + phi_m, PI - phi_m, PI + phi_p, PI - phi_p], axis=-1)
+        n = n[..., None]
+        # Preserve the multiplication order used by the existing helpers.
+        turns = tf.math.round(Phi / (2.0 * n * PI))
+        delta = Phi - 2.0 * PI * n * turns
+        return (2.0 * k * ell)[..., None] * tf.square(tf.sin(0.5 * delta))
+
     def _get_tip_a_plus(self, Phi, n, k, ell):
         """Compute the plus transition parameter without cancellation near SB."""
 
@@ -1698,8 +1854,13 @@ class VertexDiffraction:
     def _get_N_minus(self, Phi, n):
         return tf.math.round((Phi - PI) / (2*n*PI))
 
-    def _vertex_edge_geometry(self, wedge_idxs, points, use_isclose=False):
-        """Orient selected wedge tangents away from their vertex."""
+    def _vertex_edge_geometry(self, wedge_idxs, points, use_isclose=False, swap=None):
+        """Orient selected wedge tangents away from their vertex.
+
+        ``swap`` optionally supplies the endpoint-orientation mask [N],
+        allowing geometry and materials to reuse one computation. Existing
+        callers can omit it to compute the mask here as before.
+        """
         solver = self.solver_paths
         normals = tf.gather(solver._wedges_normals, wedge_idxs)
         wedge_angle = PI - acos_diff(dot(normals[:, 0], normals[:, 1], clip=True))
@@ -1707,7 +1868,8 @@ class VertexDiffraction:
         wedge_n = tf.where(is_concave, wedge_angle / PI, (2.0 * PI - wedge_angle) / PI)
 
         e_hat = tf.gather(solver._wedges_e_hat, wedge_idxs)
-        swap = self._vertex_edge_swap(wedge_idxs, points)
+        if swap is None:
+            swap = self._vertex_edge_swap(wedge_idxs, points)
 
         e_hat = tf.where(swap[:, None], -e_hat, e_hat)
         n_0_hat = tf.where(swap[:, None], normals[:, 1], normals[:, 0])

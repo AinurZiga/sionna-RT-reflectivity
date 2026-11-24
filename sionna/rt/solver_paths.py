@@ -179,6 +179,11 @@ class SolverPaths(SolverBase):
     """
 
 
+    # Enable before tracing to retain WD endpoint decisions for VD diagnostics.
+    # Shared by reflection/WD and VD/WD warnings; never changes path selection.
+    warn_sb_side_mismatch = False
+    sb_warning_tol = 1e-5  # Radians
+
     def trace_paths(self, max_depth, method, num_samples, los, reflection, diffraction,
                  refl_diff, scattering, scat_keep_prob, scat_sparsity_coef, edge_diffraction, vertex_diffraction, 
                  double_diffraction, transmission):
@@ -1368,7 +1373,8 @@ class SolverPaths(SolverBase):
         if vertex_diff_paths.objects.shape[3] > 0:
             vertex_diff_mat_t =\
                 self.vertex_diffraction.compute_fields2(etas,
-                            scattering_coefficient, vertex_diff_paths, vertex_diff_paths_tmp)
+                            scattering_coefficient, vertex_diff_paths, vertex_diff_paths_tmp,
+                            diff_paths=diff_paths, diff_paths_tmp=diff_paths_tmp)
 
             vertex_diff_mat_t = self.solver_reflection._apply_diffraction_transmission(
                 vertex_diff_paths, vertex_diff_paths_tmp, vertex_diff_mat_t, etas, thickness

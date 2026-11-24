@@ -28,9 +28,6 @@ class WedgeDiffraction:
         self._dtype = solver._dtype
         self._rdtype = solver._rdtype
 
-        self.warn_sb_side_mismatch = True
-        self.sb_warning_tol = 1e-5  # Radians
-
     def tracing(self, sources, targets, los_prim, diffraction, edge_diffraction,
                 case="both", transmission=False, link_candidates=None,
                 device_candidates=None, flat=True) -> Tuple[Paths, PathsTmpData]:
@@ -71,9 +68,20 @@ class WedgeDiffraction:
             sources, targets, los_prim, edge_diffraction, case, enabled,
             link_candidates, device_candidates,
         )
-        points, valid = self._flat_diffraction_points(
-            tf.gather(sources, rows[:, 1]), tf.gather(targets, rows[:, 0]), rows[:, 2]
-        )
+        if getattr(self.solver, "warn_sb_side_mismatch", False) and case == "both":
+            points, valid, stationary_t = self._flat_diffraction_points(
+                tf.gather(sources, rows[:, 1]), tf.gather(targets, rows[:, 0]), rows[:, 2],
+                return_parameters=True,
+            )
+            # [N, 3] = [rx, tx, wedge]. Retain rejected endpoint candidates too.
+            # Visibility and deduplication must not be mistaken for a side decision.
+            tmp.sb_wd_rows = rows
+            tmp.sb_wd_stationary_t = tf.stop_gradient(stationary_t)
+            tmp.sb_wd_finite = valid
+        else:
+            points, valid = self._flat_diffraction_points(
+                tf.gather(sources, rows[:, 1]), tf.gather(targets, rows[:, 0]), rows[:, 2]
+            )
         rows, points = tf.boolean_mask(rows, valid), tf.boolean_mask(points, valid)
         if tf.shape(rows)[0] == 0:
             return paths, tmp
@@ -147,10 +155,10 @@ class WedgeDiffraction:
 
             origins = tf.gather(self.solver._wedges_origin, wedges)
             normals = tf.gather(self.solver._wedges_normals, wedges)
-            exceptions = tf.gather(self.solver._is_edge, wedges)
-            if enabled is not None:
-                flags = tf.gather(enabled, tf.gather(self.solver._wedges_objects, wedges))
-                exceptions |= self._is_flat_shared_wedge(wedges) & (flags[:, 0] != flags[:, 1])
+            # Flat shared sheets reflect from either side, independently of
+            # transmission. Check the TX/RX side combination after the join.
+            exceptions = (tf.gather(self.solver._is_edge, wedges)
+                          | self._is_flat_shared_wedge(wedges))
 
             def device_rows(devices, check):
                 # Only device-by-wedge arrays are needed before joining the lists.
@@ -183,17 +191,26 @@ class WedgeDiffraction:
         if case in ("both", "rx"):
             allowed &= tf.reduce_any(d_rx > eps, axis=-1)
         allowed |= tf.gather(self.solver._is_edge, wedge_ids)
+        flat = self._is_flat_shared_wedge(wedge_ids)
+        if case == "both":
+            allowed = tf.where(flat, self._same_sides(d_tx[:, 0], d_rx[:, 0]), allowed)
+        elif case == "tx":
+            allowed = tf.where(flat, tf.abs(d_tx[:, 0]) > eps, allowed)
+        else:
+            allowed = tf.where(flat, tf.abs(d_rx[:, 0]) > eps, allowed)
         if enabled is not None:
             flags = tf.gather(enabled, tf.gather(self.solver._wedges_objects, wedge_ids))
-            crossed = self._is_flat_shared_wedge(wedge_ids) & self._opposite_sides(d_tx[:, 0], d_rx[:, 0])
+            crossed = flat & self._opposite_sides(d_tx[:, 0], d_rx[:, 0])
             allowed = tf.where(crossed, flags[:, 0] != flags[:, 1], allowed)
         return tf.boolean_mask(rows, allowed)
 
-    def _flat_diffraction_points(self, sources, targets, wedge_ids):
+    def _flat_diffraction_points(self, sources, targets, wedge_ids, return_parameters=False):
         """Return stationary points [N, 3] and finite-edge validity [N].
 
         Keep the existing float64 formula and axial-case handling. Invalid
         candidates are discarded by the caller before visibility tracing.
+        If return_parameters=True, also return the unrounded stationary
+        coordinate [N] in float64, before endpoint and visibility filtering.
         """
         sources, targets = tf.cast(sources, tf.float64), tf.cast(targets, tf.float64)
         origins = tf.cast(tf.gather(self.solver._wedges_origin, wedge_ids), tf.float64)
@@ -218,7 +235,10 @@ class WedgeDiffraction:
         axial_valid = axial_low <= axial_high
         t_min = tf.where(h_sum > 0.0, t_min, 0.5 * (axial_low + axial_high))
         valid = (t_min >= 0.0) & (t_min <= lengths) & ((h_sum > 0.0) | axial_valid)
-        return tf.cast(origins + t_min[:, None] * e_hat, self._rdtype), valid
+        points = tf.cast(origins + t_min[:, None] * e_hat, self._rdtype)
+        if return_parameters:
+            return points, valid, t_min
+        return points, valid
 
     @staticmethod
     def _flat_unique_paths(link_ids, angles):
@@ -421,6 +441,16 @@ class WedgeDiffraction:
         n0, nn = normals[..., 0, :], normals[..., 1, :]
         parallel = tf.linalg.norm(cross(n0, nn), axis=-1) < 1e-6
         return ~tf.gather(self.solver._is_edge, wedge_idxs) & parallel & (dot(n0, nn) > 0.0)
+
+    def _same_sides(self, d_tx, d_rx):
+        """Test either reflecting side of a two-sided flat shared sheet.
+
+        Keep grazing endpoints excluded, using the same tolerance as the
+        opposite-side test. This does not enable transmission or replace
+        the real material junction with a virtual knife edge.
+        """
+        eps = self.solver.EPSILON
+        return ((d_tx > eps) & (d_rx > eps)) | ((d_tx < -eps) & (d_rx < -eps))
 
     def _opposite_sides(self, d_tx, d_rx):
         """Test whether endpoints are strictly on opposite sides of a plane."""
@@ -887,7 +917,8 @@ class WedgeDiffraction:
             s_hat, s = normalize(targets - points)
 
             sb_check = None
-            if self.warn_sb_side_mismatch and getattr(spec_paths_tmp, "reflection_traced", False):
+            if (getattr(self.solver, "warn_sb_side_mismatch", False)
+                    and getattr(spec_paths_tmp, "reflection_traced", False)):
                 primitives = spec_paths_tmp.reflection_primitives
                 sb_check = (indices[:, :2], spec_paths.mask, primitives)
 
@@ -1222,7 +1253,7 @@ class WedgeDiffraction:
         delta = tf.stack([PI - phi_p, phi_p + PI - 2.0 * n * PI], axis=-1)
         ordinary = (n > 1.0 + 1e-5) & ~use_other_sector
         ordinary &= ~tf.gather(self.solver._is_edge, wedge_idxs)
-        near = tf.where(ordinary[:, None] & (tf.abs(delta) < self.sb_warning_tol))
+        near = tf.where(ordinary[:, None] & (tf.abs(delta) < self.solver.sb_warning_tol))
         if tf.shape(near)[0] == 0:
             return
 
