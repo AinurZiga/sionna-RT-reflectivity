@@ -30,13 +30,15 @@ class WedgeDiffraction:
 
     def tracing(self, sources, targets, los_prim, diffraction, edge_diffraction,
                 case="both", transmission=False, link_candidates=None,
-                device_candidates=None, flat=True) -> Tuple[Paths, PathsTmpData]:
+                device_candidates=None, flat=True,
+                merge_global_candidates=False) -> Tuple[Paths, PathsTmpData]:
         """Trace ordinary WD with flat candidates, packing only the final paths.
 
         Candidate rows have shape [N, 3] and contain [rx, tx, wedge].
         device_candidates is a pair of deduplicated [device, wedge] lists,
         for TX and RX respectively. The legacy link_candidates=(wedges, mask)
-        interface remains supported. Set flat=False for reflection-WD paths
+        interface remains supported. With merge_global_candidates=True, also
+        include the rows built from los_prim. Set flat=False for reflection-WD paths
         whose visibility must be completed later using virtual sources.
         """
         if not flat:
@@ -68,6 +70,12 @@ class WedgeDiffraction:
             sources, targets, los_prim, edge_diffraction, case, enabled,
             link_candidates, device_candidates,
         )
+        if merge_global_candidates and device_candidates is not None:
+            global_rows = self._flat_candidates(
+                sources, targets, los_prim, edge_diffraction, case, enabled, None, None
+            )
+            rows = self._merge_candidate_rows(global_rows, rows, tf.shape(sources)[0])
+
         if getattr(self.solver, "warn_sb_side_mismatch", False) and case == "both":
             points, valid, stationary_t = self._flat_diffraction_points(
                 tf.gather(sources, rows[:, 1]), tf.gather(targets, rows[:, 0]), rows[:, 2],
@@ -112,6 +120,16 @@ class WedgeDiffraction:
                 valid &= ~self.solver._test_obstruction(rx, direction, distance)
 
         return self._pack_flat_paths(paths, tmp, rows, points, valid, records)
+
+    @staticmethod
+    def _merge_candidate_rows(global_rows, device_rows, num_sources):
+        """Union [rx, tx, wedge] rows and group them by link for packing."""
+        rows, _ = tf.raw_ops.UniqueV2(
+            x=tf.concat([global_rows, device_rows], axis=0), axis=[0]
+        )
+        keys = (tf.cast(rows[:, 0], tf.int64) * tf.cast(num_sources, tf.int64)
+                + tf.cast(rows[:, 1], tf.int64))
+        return tf.gather(rows, tf.argsort(keys, stable=True))
 
     @staticmethod
     def _join_device_wedges(tx_rows, rx_rows, wedges, num_sources):
@@ -1545,272 +1563,101 @@ class WedgeDiffraction:
 
         return mat_t
     
-    def _compute_refl_diff(self,
-                            relative_permittivity,
-                            scattering_coefficient,
-                            paths: Paths,
-                            paths_tmp: PathsTmpData):
-        # pylint: disable=line-too-long
-        """
-        Compute the transition matrices for diffracted rays.
+    def _compute_refl_diff(self, relative_permittivity, scattering_coefficient, paths, paths_tmp,
+                           *, vertex_solver=None, edge_diffraction=False):
+        """Compose reflection with WD or VD on valid rows in physical ray order."""
+        shape = tf.concat([tf.shape(paths.mask), [2, 2]], axis=0)
+        matrices = tf.zeros(shape, self._dtype)
+        forward_order = 21 if vertex_solver is not None else 11
+        for kind in (forward_order, forward_order + 1):
+            indices = tf.cast(tf.where(paths.mask & (paths.dd_type == kind)), tf.int32)
+            if tf.shape(indices)[0] == 0:
+                continue
 
-        Input
-        ------
-        relative_permittivity : [num_shape], tf.complex
-            Tensor containing the complex relative permittivity of all shape
-            in the scene
+            reflection_first = kind == forward_order
+            refl_depth, diff_depth = (0, 1) if reflection_first else (1, 0)
+            refl_pts = tf.gather_nd(paths.vertices[refl_depth], indices)
+            diff_pts = tf.gather_nd(paths.vertices[diff_depth], indices)
+            source = tf.gather(paths.sources, indices[:, 1])
+            target = tf.gather(paths.targets, indices[:, 0])
+            first, second = (refl_pts, diff_pts) if reflection_first else (diff_pts, refl_pts)
+            k0, d0 = normalize(first - source)
+            k1, d1 = normalize(second - first)
+            k2, d2 = normalize(target - second)
 
-        scattering_coefficient : [num_shape], tf.float
-            Tensor containing the scattering coefficients of all shapes
+            wall_obj = tf.gather_nd(paths.objects[refl_depth], indices)
+            wall_normal = tf.gather_nd(paths_tmp.normals, indices)
+            diff_ids = tf.gather_nd(paths.objects[diff_depth], indices)
 
-        paths : :class:`~sionna.rt.Paths`
-            Paths to update
+            # Use the same basis on both sides of the internal matrix product.
+            tx_angles = theta_phi_from_unit_vec(k0)
+            rx_angles = theta_phi_from_unit_vec(-k2)
+            if reflection_first:
+                middle = theta_phi_from_unit_vec(k1)
+                diff_in, diff_out = k1, k2
+                s_in, s_out = d0 + d1, d2
+                diff_angles = (*middle, *rx_angles)
+                diff_source, diff_target = refl_pts, target
+                refl_in, refl_out = k0, k1
+                refl_angles = (*tx_angles, *middle)
+            else:
+                middle = theta_phi_from_unit_vec(-k1)
+                diff_in, diff_out = k0, k1
+                s_in, s_out = d0, d1 + d2
+                diff_angles = (*tx_angles, *middle)
+                diff_source, diff_target = source, refl_pts
+                refl_in, refl_out = k1, k2
+                refl_angles = (*middle, *rx_angles)
 
-        paths_tmp : :class:`~sionna.rt.PathsTmpData`
-            Addtional quantities required for paths computation
+            if vertex_solver is None:
+                normal_pair, edge, n = self._wedge_geometry(diff_ids)
+                eta_wd, scat_wd = self._wedge_materials(
+                    relative_permittivity, scattering_coefficient, diff_ids, diff_pts
+                )
+                diffraction = self._wedge_field_matrices(
+                    diff_ids, normal_pair, edge, n, eta_wd, scat_wd,
+                    diff_in, diff_out, s_in, s_out, *diff_angles
+                )
+            else:
+                diffraction = vertex_solver._mixed_vertex_matrices(
+                    relative_permittivity, scattering_coefficient, diff_ids, diff_pts,
+                    diff_source, diff_target, s_in, s_out, *diff_angles,
+                    edge_diffraction=edge_diffraction,
+                )
+            # Both diffraction kernels leave the incident spherical spreading to the caller.
+            diffraction /= tf.cast(s_in[:, None, None], self._dtype)
+            reflection = self._mixed_wall_reflection(
+                wall_obj, refl_pts, wall_normal, refl_in, refl_out, *refl_angles,
+                relative_permittivity, scattering_coefficient
+            )
+            transfer = (tf.matmul(diffraction, reflection) if reflection_first
+                        else tf.matmul(reflection, diffraction))
+            matrices = tf.tensor_scatter_nd_update(matrices, indices, transfer)
+        return matrices
 
-        Output
-        ------
-        paths : :class:`~sionna.rt.Paths`
-            Updated paths
-        """
-        mask_11 = tf.reduce_all(tf.reduce_all(paths.dd_type == 11, axis=1), axis=0)
-        mask_12 = tf.reduce_all(tf.reduce_all(paths.dd_type == 12, axis=1), axis=0)
-
-        # [max_num_paths, num_sources, num_targets, 2, 3]
-        mat_t = tf.zeros((paths.vertices[0].shape[2], paths.targets.shape[0], paths.sources.shape[0], 2, 2), dtype=self._dtype)
-
-        ### 1) refl-diff
-        paths_11 = paths.gather_paths(tf.where(mask_11)[:, 0], is_finalized=False)
-        paths_tmp_11 = paths_tmp.gather_paths(tf.where(mask_11)[:, 0])
-        if tf.reduce_any(mask_11):
-            mat_t_11 = self._compute_refl_diff_11(relative_permittivity, scattering_coefficient, paths_11, paths_tmp_11)
-
-        ### 2) diff-refl
-        paths_12 = paths.gather_paths(tf.where(mask_12)[:, 0], is_finalized=False)
-        paths_tmp_12 = paths_tmp.gather_paths(tf.where(mask_12)[:, 0])
-        if tf.reduce_any(mask_12):
-            mat_t_12 = self._compute_refl_diff_12(relative_permittivity, scattering_coefficient, paths_12, paths_tmp_12)
-
-        if tf.reduce_any(mask_11):
-            mat_t = tf.tensor_scatter_nd_update(mat_t, tf.where(mask_11), tf.transpose(mat_t_11, perm=[2, 0, 1, 3, 4]))
-        if tf.reduce_any(mask_12):
-            mat_t = tf.tensor_scatter_nd_update(mat_t, tf.where(mask_12), tf.transpose(mat_t_12, perm=[2, 0, 1, 3, 4]))
-
-        mat_t = tf.transpose(mat_t, perm=[1, 2, 0, 3, 4])
-
-        return mat_t
-        
-
-    def _compute_refl_diff_11(self,
-                            relative_permittivity,
-                            scattering_coefficient,
-                            paths,
-                            paths_tmp):
-        mask = paths.mask
-        objects = paths.objects
-        targets = paths.targets
-        sources = paths.sources
-        theta_t = paths.theta_t
-        phi_t = paths.phi_t
-        theta_r = paths.theta_r
-        phi_r = paths.phi_r
-
-        num_targets = targets.shape[0]
-        num_sources = sources.shape[0]
-        num_vertices = paths.vertices[0].shape[2]
-
-        _normals = paths_tmp.normals
-        k_i = paths_tmp.k_i
-        k_r = paths_tmp.k_r
-
-        # [1, num_sources, 1, 3]
-        sources = sources[None, :, None, :] 
-        # [num_targets, 1, 1, 3]
-        targets = targets[:, None, None, :]
-
-        #normals = paths_tmp.normals
-
-        wavelength = self.solver._scene.wavelength
-        k = 2.0*PI/wavelength
-
-        #### TX - Refl point - Diff point - RX
-        # [num_targets, num_sources, max_num_paths, 3]
-        refl_points = tf.gather(paths.vertices, 0, axis=0)
-        diff_points = tf.gather(paths.vertices, 1, axis=0)
-        # [num_targets, num_sources, max_num_paths]
-        refl_idxs = tf.gather(objects, 0, axis=0)
-        wedge_idxs = tf.gather(objects, 1, axis=0)
-        valid_wedges_idx = tf.where(wedge_idxs == -1, 0, wedge_idxs)
-        objects_indices_diff = tf.gather(self.solver._wedges_objects, valid_wedges_idx, axis=0)
-
-        r1_hat, r1 = normalize(refl_points - sources)
-        l_hat, l = normalize(diff_points - refl_points)
-        r2_hat, r2 = normalize(targets - diff_points)
-
-        # Relative perimittivities and scattering coefficients.
-        # If a callable is defined to compute the radio material properties,
-        # it is invoked. Otherwise, the radio materials of objects are used.
+    def _mixed_wall_reflection(self, objects, points, normals, k_in, k_out,
+                               theta_in, phi_in, theta_out, phi_out,
+                               relative_permittivity, scattering_coefficient):
+        """The specular interaction matrix without a spreading factor."""
         rm_callable = self._scene.radio_material_callable
         if rm_callable is None:
-            # On CPU, indexing with -1 does not work. Hence we replace -1 by 0.
-            # This makes no difference on the resulting paths as such paths
-            # are not flagged as active.
-            # [max_depth, num_targets, num_sources, max_num_paths]
-            valid_refl_object_idx = tf.where(refl_idxs == -1, 0, refl_idxs)
-
-            # [max_depth, num_targets, num_sources, max_num_paths]
-            etas_refl = tf.gather(relative_permittivity, valid_refl_object_idx)
-            scattering_coefficient_refl = tf.gather(scattering_coefficient, valid_refl_object_idx)
-            etas_diff = tf.gather(relative_permittivity, objects_indices_diff)
-            scattering_coefficient_diff = tf.gather(scattering_coefficient, objects_indices_diff)
+            eta = tf.gather(relative_permittivity, objects)
+            scattering = tf.gather(scattering_coefficient, objects)
         else:
-            # [max_depth, num_targets, num_sources, max_num_paths]
-            etas, scattering_coefficient, _  = rm_callable(objects, paths.vertices)
-
-        #### 1) Reflection
-        # [max_depth, num_targets, num_sources, max_num_paths]
-        reduction_factor_refl = tf.sqrt(1 - scattering_coefficient_refl**2)
-        reduction_factor_refl = tf.complex(reduction_factor_refl, tf.zeros_like(reduction_factor_refl))
-        #_objects = objects[0]
-        _k_t = k_i[0] # r1_hat
-        _k_r = k_r[0] # l_hat
-        #_reduction_factor = reduction_factor[0]
-        #_etas = etas[0]
-        mat_t_refl = self.solver.solver_reflection._foo(refl_idxs, _k_t, _k_r, _normals, reduction_factor_refl, etas_refl)
-
-        #### 2) Wedge Diffraction
-        # [num_targets, num_sources, max_num_paths]
-        # valid_wedges_idx = tf.where(wedge_idxs == -1, 0, wedge_idxs)
-
-        # [num_targets, num_sources, max_num_paths, 2, 3]
-        normals = tf.gather(self.solver._wedges_normals, valid_wedges_idx, axis=0)
-
-        # Compute the wedges angle
-        # [num_targets, num_sources, max_num_paths]
-        cos_wedges_angle = dot(normals[..., 0, :], normals[..., 1, :], clip=True)
-        wedges_angle = PI - tf.math.acos(cos_wedges_angle)
-        n = (2.*PI-wedges_angle)/PI
-
-        is_concave_wedge = tf.gather(self.solver._is_concave_wedge, valid_wedges_idx)
-        n = tf.where(is_concave_wedge, wedges_angle / PI, n)
-
-        # [num_targets, num_sources, max_num_paths, 3]
-        e_hat = tf.gather(self.solver._wedges_e_hat, valid_wedges_idx)
-
-        # [num_targets, num_sources, max_num_paths, 3]
-        n_0_hat = normals[...,0,:]
-        # [num_targets, num_sources, max_num_paths, 3]
-        n_n_hat = normals[...,1,:]
-
-        _theta_t, _phi_t = theta_phi_from_unit_vec(k_i[1])
-
-        mat_t_diff = self._diffraction_compute_fields(l_hat, r2_hat, n_0_hat, n_n_hat, e_hat, etas_diff,
-                                    scattering_coefficient_diff, r1+l, r2, n, mask, _theta_t, _phi_t, theta_r, phi_r, skip_sf=True)
-
-        ### 3) total field
-        sf = 1 / tf.sqrt(r2 * (r1+l) * (r1+l+r2))
-        mat_t = tf.multiply(mat_t_refl, mat_t_diff) * tf.cast(sf, self.solver._dtype)[..., None, None]
-
-        return mat_t
-    
-    def _compute_refl_diff_12(self,
-                            relative_permittivity,
-                            scattering_coefficient,
-                            paths,
-                            paths_tmp):
-        mask = paths.mask
-        objects = paths.objects
-        targets = paths.targets
-        sources = paths.sources
-        theta_t = paths.theta_t
-        phi_t = paths.phi_t
-        theta_r = paths.theta_r
-        phi_r = paths.phi_r
-
-        num_targets = targets.shape[0]
-        num_sources = sources.shape[0]
-        num_vertices = paths.vertices[0].shape[2]
-
-        _normals = paths_tmp.normals
-        k_i = paths_tmp.k_i
-        k_r = paths_tmp.k_r
-
-        # [1, num_sources, 1, 3]
-        sources = sources[None, :, None, :] 
-        # [num_targets, 1, 1, 3]
-        targets = targets[:, None, None, :]
-
-        #normals = paths_tmp.normals
-
-        wavelength = self.solver._scene.wavelength
-        k = 2.0*PI/wavelength
-
-        #### TX - Diff_point - Refl_point - RX
-        # [num_targets, num_sources, max_num_paths, 3]
-        diff_points = tf.gather(paths.vertices, 0, axis=0)
-        refl_points = tf.gather(paths.vertices, 1, axis=0)
-        # [num_targets, num_sources, max_num_paths]
-        wedge_idxs = tf.gather(objects, 0, axis=0)
-        refl_idxs = tf.gather(objects, 1, axis=0)
-        valid_wedges_idx = tf.where(wedge_idxs == -1, 0, wedge_idxs)
-        objects_indices_diff = tf.gather(self.solver._wedges_objects, valid_wedges_idx, axis=0)
-
-        rm_callable = self._scene.radio_material_callable
-        if rm_callable is None:
-            # [max_depth, num_targets, num_sources, max_num_paths]
-            valid_refl_object_idx = tf.where(refl_idxs == -1, 0, refl_idxs)
-
-            # [max_depth, num_targets, num_sources, max_num_paths]
-            etas_refl = tf.gather(relative_permittivity, valid_refl_object_idx)
-            scattering_coefficient_refl = tf.gather(scattering_coefficient, valid_refl_object_idx)
-            etas_diff = tf.gather(relative_permittivity, objects_indices_diff)
-            scattering_coefficient_diff = tf.gather(scattering_coefficient, objects_indices_diff)
-        else:
-            # [max_depth, num_targets, num_sources, max_num_paths]
-            etas, scattering_coefficient, _  = rm_callable(objects, paths.vertices)
-
-        ################################
-        r1_hat, r1 = normalize(diff_points - sources)
-        l_hat, l = normalize(refl_points - diff_points)
-        r2_hat, r2 = normalize(targets - refl_points)
-
-        #### 1) Wedge Diffraction
-        # [num_targets, num_sources, max_num_paths, 2, 3]
-        normals = tf.gather(self.solver._wedges_normals, valid_wedges_idx, axis=0)
-
-        # Compute the wedges angle
-        # [num_targets, num_sources, max_num_paths]
-        cos_wedges_angle = dot(normals[..., 0, :], normals[..., 1, :], clip=True)
-        wedges_angle = PI - tf.math.acos(cos_wedges_angle)
-        n = (2.*PI-wedges_angle)/PI
-
-        is_concave_wedge = tf.gather(self.solver._is_concave_wedge, valid_wedges_idx)
-        n = tf.where(is_concave_wedge, wedges_angle / PI, n)
-
-        # [num_targets, num_sources, max_num_paths, 3]
-        e_hat = tf.gather(self.solver._wedges_e_hat, valid_wedges_idx)
-
-        # [num_targets, num_sources, max_num_paths, 3]
-        n_0_hat = normals[...,0,:]
-        # [num_targets, num_sources, max_num_paths, 3]
-        n_n_hat = normals[...,1,:]
-
-        _theta_r, _phi_r = theta_phi_from_unit_vec(-l_hat)  # l_hat
-
-        mat_t_diff = self._diffraction_compute_fields(r1_hat, l_hat, n_0_hat, n_n_hat, e_hat, etas_diff,
-                                    scattering_coefficient_diff, r1, l+r2, n, mask, theta_t, phi_t, _theta_r, _phi_r, skip_sf=True)
-        
-        #### 2) Reflection
-        # [max_depth, num_targets, num_sources, max_num_paths]
-        reduction_factor_refl = tf.sqrt(1 - scattering_coefficient_refl**2)
-        reduction_factor_refl = tf.complex(reduction_factor_refl, tf.zeros_like(reduction_factor_refl))
-        _k_t = k_i[1] # l_hat
-        _k_r = k_r[1] # r2_hat
-        mat_t_refl = self.solver.solver_reflection._foo(refl_idxs, _k_t, _k_r, _normals, reduction_factor_refl, etas_refl)
-
-        ### 3) total field
-        sf = 1 / tf.sqrt(r1 * (r2+l) * (r1+l+r2))
-        mat_t = tf.multiply(mat_t_diff, mat_t_refl) * tf.cast(sf, self.solver._dtype)[..., None, None]
-
-        return mat_t
+            eta, scattering, _ = rm_callable(objects, points)
+        r_s, r_p = material_reflection_coefficients(
+            eta, -dot(k_in, normals, clip=True),
+            tf.gather(self.solver._object_thickness, objects),
+            tf.gather(self.solver._object_transmission_enabled, objects),
+            self._scene.wavelength,
+        )
+        e_i_s, e_i_p, e_r_s, e_r_p = compute_field_unit_vectors(
+            k_in, k_out, normals, self.solver.EPSILON
+        )
+        into_sp = component_transform(theta_hat(theta_in, phi_in), phi_hat(phi_in), e_i_s, e_i_p)
+        from_sp = component_transform(e_r_s, e_r_p, theta_hat(theta_out, phi_out),
+                                      phi_hat(phi_out))
+        scale = tf.cast(tf.sqrt(1 - scattering**2), self._dtype)
+        coeff = tf.stack([r_s, r_p], axis=-1) * scale[:, None]
+        return tf.matmul(tf.cast(from_sp, self._dtype),
+                         coeff[..., None] * tf.cast(into_sp, self._dtype))

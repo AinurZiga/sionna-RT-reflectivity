@@ -42,6 +42,9 @@ class ObjectsGeometry:
         self.is_double_diffraction = False
         self.is_triple_diffraction = False
         self.add_obj_primitives = True
+        self.enable_env_object_rr = False  # Supplement two-bounce specular candidates.
+        self.enable_env_object_rwd = False  # Environment reflection and object wedge diffraction.
+        self.enable_env_object_rvd = False  # Environment reflection and object vertex diffraction.
         self.is_sbr_rxs = True
 
         self.is_glass_transmission = False

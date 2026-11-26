@@ -47,7 +47,8 @@ class DiffractionTables:
                 raise ValueError(f"Unsupported GFI table format: {file_gfi_table}")
 
         # self.file_T_ev = data_dir / "ev_manual_20.npz" if ev_filename is None else Path(ev_filename)
-        self.file_T_ev = "/home/aizi0357/sionna_v0/_my_examples/examples/diffraction/EV/data/ev_manual_20.npz"
+        # self.file_T_ev = "/home/aizi0357/sionna_v0/_my_examples/examples/diffraction/EV/data/ev_manual_20.npz"
+        self.file_T_ev = "/Users/ainur/projects/sionna_v0_examples/examples/diffraction/EV/data/ev_a25_b25_c25_w25.npz"
 
         with np.load(self.file_T_ev, allow_pickle=False) as data:
             axes = [data[k] for k in ("alpha_nodes", "beta_nodes", "chi_nodes", "w_nodes")]

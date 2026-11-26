@@ -44,6 +44,8 @@ class SolverBase:
         Defaults to `tf.complex64`.
     """
 
+    NUM_RX_FIBONACCI_SAMPLES = 10_000  # Per receiver-side source.
+
     # Small value used to discard intersection with edges, avoid
     # self-intersection, etc.
     # Resolution of float32 1e-6:

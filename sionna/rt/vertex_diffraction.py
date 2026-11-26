@@ -251,12 +251,16 @@ class VertexDiffraction:
     def _flat_vertex_edge_visibility(self, rows, edge_paths, wedges, sources, targets,
                                      case, edge_diffraction, enabled):
         """Apply the existing sector, planar-edge and junction rules to [M] edges."""
-        solver = self.solver_paths
-        origins = tf.gather(solver._wedges_origin, wedges)
-        normals = tf.gather(solver._wedges_normals, wedges)
         path_rows = tf.gather(rows, edge_paths)
         tx = tf.gather(sources, path_rows[:, 1])
         rx = tf.gather(targets, path_rows[:, 0])
+        return self._vertex_edge_sector_mask(wedges, tx, rx, case, edge_diffraction, enabled)
+
+    def _vertex_edge_sector_mask(self, wedges, tx, rx, case, edge_diffraction, enabled):
+        """Test each edge against the endpoints of its incident and outgoing rays."""
+        solver = self.solver_paths
+        origins = tf.gather(solver._wedges_origin, wedges)
+        normals = tf.gather(solver._wedges_normals, wedges)
         d_tx = dot((tx - origins)[:, None, :], normals)
         d_rx = dot((rx - origins)[:, None, :], normals)
         eps = tf.cast(solver.EPSILON, d_tx.dtype)
@@ -281,6 +285,42 @@ class VertexDiffraction:
             allowed = tf.where(crossed, face_flags[:, 0] != face_flags[:, 1], allowed)
         is_edge = tf.gather(solver._is_edge, wedges)
         return (allowed | is_edge) if edge_diffraction else (allowed & ~is_edge)
+
+    def _mixed_vertex_edge_rows(self, vertex_ids, sources, targets, edge_diffraction):
+        """Return [M] path row IDs and [M] wedge IDs for N physical vertex interactions."""
+        incidence = tf.gather(self.vertices_2_wedges, vertex_ids)
+        path_rows = tf.cast(incidence.value_rowids(), tf.int32)
+        wedges = tf.cast(incidence.values, tf.int32)
+        valid = wedges >= 0
+        path_rows, wedges = [tf.boolean_mask(x, valid) for x in (path_rows, wedges)]
+        allowed = self._vertex_edge_sector_mask(
+            wedges, tf.gather(sources, path_rows), tf.gather(targets, path_rows),
+            "both", edge_diffraction, enabled=None,
+        )
+        return tf.boolean_mask(path_rows, allowed), tf.boolean_mask(wedges, allowed)
+
+    def _mixed_vertex_matrices(self, relative_permittivity, scattering_coefficient,
+                               vertex_ids, points, sources, targets, s_in, s_out,
+                               theta_t, phi_t, theta_r, phi_r, edge_diffraction):
+        """Sum the adjacent-edge VD matrices for N valid mixed paths."""
+        path_rows, wedges = self._mixed_vertex_edge_rows(
+            vertex_ids, sources, targets, edge_diffraction
+        )
+        num_paths = tf.shape(vertex_ids)[0]
+        if tf.size(wedges) == 0:
+            return tf.zeros([num_paths, 2, 2], self._dtype)
+
+        edge_points = tf.gather(points, path_rows)
+        etas, scattering = self._vertex_edge_materials(
+            relative_permittivity, scattering_coefficient, wedges, edge_points
+        )
+        angles = [tf.gather(x, path_rows) for x in (theta_t, phi_t, theta_r, phi_r)]
+        distances = tuple(tf.gather(x, path_rows) for x in (s_in, s_out))
+        matrices = self._vertex_edge_matrices(
+            wedges, edge_points, tf.gather(sources, path_rows), tf.gather(targets, path_rows),
+            etas, scattering, *angles, propagation_distances=distances,
+        )
+        return tf.math.unsorted_segment_sum(matrices, path_rows, num_paths)
 
     def _tracing_legacy(self, sources, targets, case="both", is_dd=False, edge_diffraction=True,
                 transmission=False, link_candidates=None):
@@ -860,7 +900,7 @@ class VertexDiffraction:
 
     def _vertex_edge_matrices(self, wedge_idxs, points, sources, targets, etas, scattering,
                             theta_t, phi_t, theta_r, phi_r, metal_knife_edge=False,
-                            sb_check=None):
+                            sb_check=None, propagation_distances=None):
         wavelength = self.solver_paths._scene.wavelength
         k = 2.0 * PI / wavelength
 
@@ -878,6 +918,9 @@ class VertexDiffraction:
 
         s_prime_hat, s_prime = normalize(points - sources)
         s_hat, s = normalize(targets - points)
+        if propagation_distances is not None:
+            # Reflection unfolds a leg's length but does not change the local ray directions.
+            s_prime, s = propagation_distances
 
         incident_slab_coeffs = None
 

@@ -450,7 +450,7 @@ class Scene:
             allowed for tracing the paths.
             Defaults to 3.
 
-        method : str ("exhaustive"|"fibonacci")
+        method : str ("exhaustive"|"fibonacci"|"env_driven")
             Method to be used to list candidate paths.
             The "exhaustive" method tests all possible combination of primitives as
             paths. This method is not compatible with scattering.
@@ -458,7 +458,14 @@ class Scene:
             candidate chains of primitives. Initial ray directions are arranged
             in a Fibonacci lattice on the unit sphere. This method can be
             applied to very large scenes. However, there is no guarantee that
-            all possible paths are found.
+            all possible paths are found. When ObjectsGeometry is present,
+            visible facet centers supplement the first-order reflection and
+            wedge diffraction candidates. Vertex and double diffraction use
+            facet visibility on the selected objects. Diffuse scattering uses
+            only Fibonacci hits, with optional specular bounces before
+            the final diffuse interaction.
+            The "env_driven" method uses facet-center visibility to find
+            candidates and does not support diffuse scattering.
             Defaults to "fibonacci".
 
         num_samples: int
@@ -491,7 +498,7 @@ class Scene:
             Defaults to 0.001.
 
         scat_sparsity_coef : int
-            To make the diffuse scattered paths more sparse
+            Keep every ``scat_sparsity_coef``th diffuse launch direction per source.
 
         edge_diffraction : bool
             If set to `False`, only diffraction on wedges, i.e., edges that
@@ -768,7 +775,7 @@ class Scene:
             Maximum depth (i.e., number of bounces) allowed for tracing the
             paths. Defaults to 3.
 
-        method : str ("exhaustive"|"fibonacci")
+        method : str ("exhaustive"|"fibonacci"|"env_driven")
             Ray tracing method to be used.
             The "exhaustive" method tests all possible combinations of primitives.
             This method is not compatible with scattering.
@@ -776,7 +783,14 @@ class Scene:
             candidate chains of primitives. Initial ray directions are chosen
             according to a Fibonacci lattice on the unit sphere. This method can be
             applied to very large scenes. However, there is no guarantee that
-            all possible paths are found.
+            all possible paths are found. When ObjectsGeometry is present,
+            visible facet centers supplement the first-order reflection and
+            wedge diffraction candidates. Vertex and double diffraction use
+            facet visibility on the selected objects. Diffuse scattering uses
+            only Fibonacci hits, with optional specular bounces before
+            the final diffuse interaction.
+            The "env_driven" method uses facet-center visibility to find
+            candidates and does not support diffuse scattering.
             Defaults to "fibonacci".
 
         num_samples : int
@@ -814,7 +828,7 @@ class Scene:
             Must be in the range (0,1). Defaults to 0.001.
 
         scat_sparsity_coef : int
-            To make the diffuse scattered paths more sparse
+            Keep every ``scat_sparsity_coef``th diffuse launch direction per source.
 
         edge_diffraction : bool
             If set to `False`, only diffraction on wedges, i.e., edges that
