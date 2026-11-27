@@ -798,7 +798,7 @@ class VertexDiffraction:
         return paths
 
     def compute_fields2(self, relative_permittivity, scattering_coefficient, paths, paths_tmp,
-                        diff_paths=None, diff_paths_tmp=None):
+                        diff_paths=None, diff_paths_tmp=None, debug_resolve_edges=False):
         shape = tf.shape(paths.objects[0])  # [targets, sources, vertex_paths]
         indices = tf.cast(tf.where(paths.vertex_wedge_mask & paths.mask[..., None]), tf.int32)
         path_indices = indices[:, :3]
@@ -813,6 +813,8 @@ class VertexDiffraction:
         path_indices = indices[:, :3]
 
         if tf.shape(indices)[0] == 0:
+            if debug_resolve_edges:
+                return path_indices, tf.cast(wedge_idxs, tf.int32), tf.zeros([0, 2, 2], self._dtype)
             return tf.zeros(tf.concat([shape, [2, 2]], axis=0), dtype=self._dtype)
 
         ### flatten everything
@@ -876,6 +878,12 @@ class VertexDiffraction:
             edge_matrices = tf.tensor_scatter_nd_update(
                 edge_matrices, transmitted_rows, compute_rows(transmitted_rows, True)
             )
+
+        if debug_resolve_edges:
+            # Each row keeps the incident spreading of its parent VD path.
+            _, s_prime = normalize(points - sources)
+            edge_matrices /= tf.cast(s_prime[:, None, None], self._dtype)
+            return path_indices, tf.cast(wedge_idxs, tf.int32), edge_matrices
 
         path_ids = (path_indices[:, 0] * shape[1] + path_indices[:, 1]) * shape[2] + path_indices[:, 2]
         matrices = tf.math.unsorted_segment_sum(edge_matrices, path_ids, tf.reduce_prod(shape))

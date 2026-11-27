@@ -879,6 +879,37 @@ class Paths:
     def true_objects(self, v):
         self._true_objects = v
 
+    @property
+    def wedge_ids(self):
+        """Debug wedge IDs [num_targets, num_sources, num_paths], or None.
+
+        Entries align with objects[0], without a batch axis. Invalid slots
+        and other mechanisms are marked -1.
+        """
+        return getattr(self, "_wedge_ids", None)
+
+    @wedge_ids.setter
+    def wedge_ids(self, value):
+        self._wedge_ids = value
+
+    @property
+    def wedge_pairs(self):
+        """Debug wedge pairs [target, source, path, 2] in TX-to-RX order."""
+        return getattr(self, "_wedge_pairs", None)
+
+    @wedge_pairs.setter
+    def wedge_pairs(self, value):
+        self._wedge_pairs = value
+
+    @property
+    def dd_types(self):
+        """Debug labels [target, source, path]: EE=0, EV=1, VE=2, VV=3, SV=4."""
+        return getattr(self, "_dd_types", None)
+
+    @dd_types.setter
+    def dd_types(self, value):
+        self._dd_types = value
+
     def merge(self, more_paths):
         r"""
         Merge ``more_paths`` with the current paths and returns the so-obtained
@@ -897,6 +928,25 @@ class Paths:
         more_true_objects = more_paths.true_objects
         more_types = more_paths.types
         more_my_types = more_paths.my_types
+
+        if self.wedge_ids is not None or more_paths.wedge_ids is not None:
+            left = self.wedge_ids
+            right = more_paths.wedge_ids
+            if left is None:
+                left = tf.fill(tf.shape(self.mask), -1)
+            if right is None:
+                right = tf.fill(tf.shape(more_paths.mask), -1)
+            self.wedge_ids = tf.concat([left, right], axis=2)
+
+        for name, tail in (("wedge_pairs", [2]), ("dd_types", [])):
+            left, right = getattr(self, name), getattr(more_paths, name)
+            if left is None and right is None:
+                continue
+            if left is None:
+                left = tf.fill(tf.concat([tf.shape(self.mask), tf.constant(tail, tf.int32)], axis=0), -1)
+            if right is None:
+                right = tf.fill(tf.concat([tf.shape(more_paths.mask), tf.constant(tail, tf.int32)], axis=0), -1)
+            setattr(self, name, tf.concat([left, right], axis=2))
 
         # The paths to merge must have the same number of sources and targets
         assert more_paths.targets.shape[0] == self.targets.shape[0],\
@@ -1127,6 +1177,12 @@ class Paths:
         new_paths.objects = tf.gather(self.objects, indices, axis=axis)
         new_paths.true_objects = tf.gather(self.true_objects, indices, axis=axis)
         new_paths.my_types = tf.gather(self.my_types, indices, axis=axis)
+        if self.wedge_ids is not None:
+            new_paths.wedge_ids = tf.gather(self.wedge_ids, indices, axis=axis - 1)
+        for name in ("wedge_pairs", "dd_types"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(new_paths, name, tf.gather(value, indices, axis=axis - 1))
 
         if not is_finalized:
             new_paths.types = self.types

@@ -7,6 +7,7 @@ import drjit as dr
 import tensorflow as tf
 import trimesh
 from typing import Tuple, TYPE_CHECKING
+from functools import cached_property
 
 from sionna.constants import SPEED_OF_LIGHT, PI
 from sionna.utils.tensors import expand_to_rank, insert_dims, flatten_dims,\
@@ -46,18 +47,38 @@ class DiffractionTables:
             else:
                 raise ValueError(f"Unsupported GFI table format: {file_gfi_table}")
 
-        # self.file_T_ev = data_dir / "ev_manual_20.npz" if ev_filename is None else Path(ev_filename)
-        # self.file_T_ev = "/home/aizi0357/sionna_v0/_my_examples/examples/diffraction/EV/data/ev_manual_20.npz"
-        self.file_T_ev = "/Users/ainur/projects/sionna_v0_examples/examples/diffraction/EV/data/ev_a25_b25_c25_w25.npz"
-
-        with np.load(self.file_T_ev, allow_pickle=False) as data:
-            axes = [data[k] for k in ("alpha_nodes", "beta_nodes", "chi_nodes", "w_nodes")]
-            low = np.stack([data["R_e_T"], data["R_o_0"]], axis=-1).reshape(-1, 2)
-            phase = np.stack([data["R_e_H"], data["R_A"], data["R_o_B"]], axis=-1).reshape(-1, 3)
-        self.ev_transition = EVInterpolator(
-            axes, low, phase, transition_func, slope_transition_func,
-            real_dtype=self.dtype.real_dtype,
+        self.file_T_ev = (
+            data_dir / "ev_manual_22.npz"
+            if ev_filename is None
+            else Path(ev_filename).expanduser()
         )
+
+    @cached_property
+    def ev_transition(self):
+        """Load the EV interpolator on first use."""
+        try:
+            with np.load(self.file_T_ev, allow_pickle=False) as data:
+                axes = [
+                    data[key]
+                    for key in ("alpha_nodes", "beta_nodes", "chi_nodes", "w_nodes")
+                ]
+                low = np.stack(
+                    [data["R_e_T"], data["R_o_0"]], axis=-1
+                ).reshape(-1, 2)
+                phase = np.stack(
+                    [data["R_e_H"], data["R_A"], data["R_o_B"]], axis=-1
+                ).reshape(-1, 3)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"EV table not found: {self.file_T_ev}. "
+                "From the repository root, run: python tools/generate_ev_table.py"
+            ) from exc
+
+        with tf.init_scope():
+            return EVInterpolator(
+                axes, low, phase, transition_func, slope_transition_func,
+                real_dtype=self.dtype.real_dtype,
+            )
 
 def calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat):
     r"""

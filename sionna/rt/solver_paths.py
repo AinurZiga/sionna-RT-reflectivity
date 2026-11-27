@@ -184,6 +184,9 @@ class SolverPaths(SolverBase):
     warn_sb_side_mismatch = False
     sb_warning_tol = 1e-5  # Radians
 
+    # Split first-order VD into one path per contributing wedge.
+    debug_resolve_edges = False
+
     def trace_paths(self, max_depth, method, num_samples, los, reflection, diffraction,
                  refl_diff, scattering, scat_keep_prob, scat_sparsity_coef, edge_diffraction, vertex_diffraction, 
                  double_diffraction, transmission):
@@ -849,7 +852,14 @@ class SolverPaths(SolverBase):
 
             # Shared-vertex candidates stay flat through the excess-length and ray checks.
             if trace_sv and use_link_candidates:
-                sv_rows = self._build_sv_candidate_rows(sources, targets, dd_tx_edges, dd_rx_edges)
+                sv_tx_edges, sv_rx_edges = dd_tx_edges, dd_rx_edges
+                if method == "env_driven":
+                    # A hidden facet center does not imply a hidden endpoint.
+                    # Build SV pairs by topology and test the actual vertex rays.
+                    sv_wedges = self._wedges_from_primitives(dd_primitive_ids, True)
+                    sv_tx_edges = self._all_device_items(tf.shape(sources)[0], sv_wedges)
+                    sv_rx_edges = self._all_device_items(tf.shape(targets)[0], sv_wedges)
+                sv_rows = self._build_sv_candidate_rows(sources, targets, sv_tx_edges, sv_rx_edges)
                 if method == "fibonacci":
                     sv_rows = tf.boolean_mask(
                         sv_rows, tf.gather(geom.active_vertices_dd, sv_rows[:, 4])
@@ -1284,6 +1294,7 @@ class SolverPaths(SolverBase):
             Only returned if `testing` is set to `True`.
         """
 
+        debug_resolve_edges = self.debug_resolve_edges
         sources = spec_paths.sources
         targets = spec_paths.targets
         num_sources = tf.shape(sources)[0]
@@ -1385,6 +1396,8 @@ class SolverPaths(SolverBase):
             diff_paths.doppler = self._compute_doppler_shifts(diff_paths,
                                                               diff_paths_tmp,
                                                               velocity)
+            if debug_resolve_edges:
+                diff_paths.wedge_ids = tf.where(diff_paths.mask, diff_paths.objects[0], -1)
             all_paths = all_paths.merge(diff_paths)
             # Only the transition matrix and vector of incidence/reflection are
             # required for the computation of the paths coefficients
@@ -1405,19 +1418,30 @@ class SolverPaths(SolverBase):
         ############################################
         #    
         if vertex_diff_paths.objects.shape[3] > 0:
-            vertex_diff_mat_t =\
-                self.vertex_diffraction.compute_fields2(etas,
-                            scattering_coefficient, vertex_diff_paths, vertex_diff_paths_tmp,
-                            diff_paths=diff_paths, diff_paths_tmp=diff_paths_tmp)
-
-            vertex_diff_mat_t = self.solver_reflection._apply_diffraction_transmission(
-                vertex_diff_paths, vertex_diff_paths_tmp, vertex_diff_mat_t, etas, thickness
-            )                            
-            
+            vertex_diff_mat_t = self.vertex_diffraction.compute_fields2(
+                etas, scattering_coefficient, vertex_diff_paths, vertex_diff_paths_tmp,
+                diff_paths=diff_paths, diff_paths_tmp=diff_paths_tmp,
+                debug_resolve_edges=debug_resolve_edges,
+            )
             vertex_diff_paths.doppler = self._compute_doppler_shifts(vertex_diff_paths,
                                                                 vertex_diff_paths_tmp,
                                                                 velocity)
-            
+            if debug_resolve_edges:
+                parent, wedges, edge_matrices = vertex_diff_mat_t
+                edge_matrices = self.solver_reflection._apply_diffraction_transmission(
+                    vertex_diff_paths, vertex_diff_paths_tmp, edge_matrices, etas, thickness,
+                    path_indices=parent,
+                )
+                vertex_diff_paths, vertex_diff_paths_tmp, vertex_diff_mat_t = (
+                    self._pack_resolved_vertex_edges(
+                        vertex_diff_paths, vertex_diff_paths_tmp, parent, wedges, edge_matrices
+                    )
+                )
+            else:
+                vertex_diff_mat_t = self.solver_reflection._apply_diffraction_transmission(
+                    vertex_diff_paths, vertex_diff_paths_tmp, vertex_diff_mat_t, etas, thickness
+                )
+
             all_paths = all_paths.merge(vertex_diff_paths)
             # Only the transition matrix and vector of incidence/reflection are
             # required for the computation of the paths coefficients
@@ -1488,12 +1512,18 @@ class SolverPaths(SolverBase):
         ############################################
         if dd_paths.objects.shape[3] > 0:
             # Compute the transition matrices and Doppler shifts
-            dd_mat_t =\
-                self.double_diffraction.compute_fields(etas,
-                            scattering_coefficient, dd_paths, dd_paths_tmp)
+            dd_mat_t = self.double_diffraction.compute_fields(
+                etas, scattering_coefficient, dd_paths, dd_paths_tmp,
+                debug_resolve_edges=debug_resolve_edges,
+            )
             dd_paths.doppler = self._compute_doppler_shifts(dd_paths,
                                                               dd_paths_tmp,
                                                               velocity)
+            if debug_resolve_edges:
+                parent, pairs, dd_types, matrices = dd_mat_t
+                dd_paths, dd_paths_tmp, dd_mat_t = self._pack_resolved_vertex_edges(
+                    dd_paths, dd_paths_tmp, parent, pairs, matrices, dd_types=dd_types
+                )
             all_paths = all_paths.merge(dd_paths)
             # Only the transition matrix and vector of incidence/reflection are
             # required for the computation of the paths coefficients
@@ -1582,6 +1612,11 @@ class SolverPaths(SolverBase):
         # Otherwise, expand with the antenna dimensions.
         # [num_targets, num_sources, max_num_paths]
         all_paths.targets_sources_mask = all_paths.mask
+        if debug_resolve_edges and all_paths.wedge_ids is None:
+            all_paths.wedge_ids = tf.fill(tf.shape(all_paths.mask), -1)
+        if debug_resolve_edges and all_paths.wedge_pairs is None:
+            all_paths.wedge_pairs = tf.fill(tf.concat([tf.shape(all_paths.mask), [2]], axis=0), -1)
+            all_paths.dd_types = tf.fill(tf.shape(all_paths.mask), -1)
         if self._scene.synthetic_array:
             # [num_rx, num_tx, 2, 2]
             mat_t = all_paths_tmp.mat_t
@@ -1689,6 +1724,57 @@ class SolverPaths(SolverBase):
         else:
             output = (sources, targets, all_paths.to_dict())
         return output
+
+    def _pack_resolved_vertex_edges(self, paths, tmp, parent, wedge_ids, edge_matrices,
+                                    dd_types=None):
+        """Pack resolved diffraction contributions, preserving parent geometry."""
+        num_targets, num_sources = tf.shape(paths.mask)[0], tf.shape(paths.mask)[1]
+        link_ids = parent[:, 0] * num_sources + parent[:, 1]
+        if dd_types is not None:
+            # DD contributions arrive grouped by mechanism, then by link.
+            order = tf.argsort(link_ids, stable=True)
+            link_ids, parent, wedge_ids, edge_matrices, dd_types = [
+                tf.gather(value, order) for value in (link_ids, parent, wedge_ids, edge_matrices, dd_types)
+            ]
+        counts = tf.math.unsorted_segment_sum(
+            tf.ones_like(link_ids), link_ids, num_targets * num_sources
+        )
+        slots = tf.range(tf.size(link_ids)) - tf.gather(
+            tf.cumsum(counts, exclusive=True), link_ids
+        )
+        indices = tf.concat([parent[:, :2], slots[:, None]], axis=1)
+        num_slots = tf.reduce_max(tf.concat([counts, tf.zeros([1], counts.dtype)], axis=0))
+        shape = tf.stack([num_targets, num_sources, num_slots])
+
+        def pack(values, fill=None):
+            packed_shape = tf.concat([shape, tf.shape(values)[1:]], axis=0)
+            if fill is None:
+                return tf.scatter_nd(indices, values, packed_shape)
+            base = tf.fill(packed_shape, tf.cast(fill, values.dtype))
+            return tf.tensor_scatter_nd_update(base, indices, values)
+
+        mechanism = Paths.VERTEX_DIFFRACTED if dd_types is None else Paths.DOUBLE_DIFF
+        resolved = Paths(paths.sources, paths.targets, self._scene, types=mechanism)
+        resolved.mask = pack(tf.ones_like(link_ids, tf.bool))
+        if dd_types is None:
+            resolved.wedge_ids = pack(wedge_ids, -1)
+        else:
+            resolved.wedge_pairs = pack(wedge_ids, -1)
+            resolved.dd_types = pack(dd_types, -1)
+        for name in ("theta_t", "phi_t", "theta_r", "phi_r", "doppler"):
+            setattr(resolved, name, pack(tf.gather_nd(getattr(paths, name), parent)))
+        resolved.tau = pack(tf.gather_nd(paths.tau, parent), -1)
+        for name in ("objects", "true_objects", "my_types", "vertices"):
+            value = getattr(paths, name)
+            fill = None if name == "vertices" else -1
+            setattr(resolved, name, tf.stack([
+                pack(tf.gather_nd(value[d], parent), fill) for d in range(value.shape[0])
+            ], axis=0))
+
+        resolved_tmp = PathsTmpData(paths.sources, paths.targets, self._dtype)
+        resolved_tmp.k_tx = pack(tf.gather_nd(tmp.k_tx, parent))
+        resolved_tmp.k_rx = pack(tf.gather_nd(tmp.k_rx, parent))
+        return resolved, resolved_tmp, pack(edge_matrices)
 
     ##################################################################
     # Methods for finding candiate primitives and edges for reflected

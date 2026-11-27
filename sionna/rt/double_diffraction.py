@@ -3107,7 +3107,7 @@ class DoubleDiffraction:
     def compute_fields(self, relative_permittivity,
                                 scattering_coefficient, 
                                 paths: Paths, 
-                                paths_tmp: PathsTmpData):
+                                paths_tmp: PathsTmpData, debug_resolve_edges=False):
         
         transmission = getattr(paths_tmp, "junction_transmission", False)
         mask_wedge_wedge = tf.reduce_all(tf.reduce_all(paths.dd_type == 0, axis=1), axis=0)
@@ -3115,6 +3115,48 @@ class DoubleDiffraction:
         mask_vertex_wedge = tf.reduce_all(tf.reduce_all(paths.dd_type == 2, axis=1), axis=0)
         mask_vertex_vertex = tf.reduce_all(tf.reduce_all(paths.dd_type == 3, axis=1), axis=0)
         mask_shared_vertex = tf.reduce_all(tf.reduce_all(paths.dd_type == 4, axis=1), axis=0)
+
+        if debug_resolve_edges:
+            # Dispatch by the same slot groups as the normal field calculation.
+            groups = (
+                (0, mask_wedge_wedge, self.compute_fields_wedge_wedge),
+                (1, mask_wedge_vertex, self.compute_fields_wedge_vertex),
+                (2, mask_vertex_wedge, self.compute_fields_vertex_wedge),
+                (3, mask_vertex_vertex, None),
+                (4, mask_shared_vertex, self.compute_fields_sv),
+            )
+            parents, pairs, mechanisms, fields = [], [], [], []
+            for kind, mask, kernel in groups:
+                slots = tf.cast(tf.where(mask)[:, 0], tf.int32)
+                if tf.size(slots) == 0:
+                    continue
+                selected = paths.gather_paths(slots, is_finalized=False)
+                selected_tmp = paths_tmp.gather_paths(slots)
+                args = (relative_permittivity, scattering_coefficient, selected, selected_tmp)
+                if kind in (1, 2):
+                    indices, pair, field = kernel(
+                        *args, transmission=transmission, debug_resolve_edges=True
+                    )
+                else:
+                    indices = tf.cast(tf.where(selected.mask), tf.int32)
+                    if kind == 3:
+                        # VV has no field kernel in the standard dispatch.
+                        pair = tf.fill([tf.shape(indices)[0], 2], -1)
+                        field = tf.zeros([tf.shape(indices)[0], 2, 2], self._dtype)
+                    else:
+                        pair = tf.stack([
+                            tf.gather_nd(selected.objects[d], indices) for d in (0, 1)
+                        ], axis=1)
+                        packed = kernel(*args, transmission=transmission) if kind == 0 else kernel(*args)
+                        field = tf.gather_nd(packed, indices)
+                parents.append(tf.concat([indices[:, :2], tf.gather(slots, indices[:, 2:3])], axis=1))
+                pairs.append(tf.cast(pair, tf.int32))
+                mechanisms.append(tf.fill([tf.shape(indices)[0]], kind))
+                fields.append(field)
+            if not parents:
+                return (tf.zeros([0, 3], tf.int32), tf.zeros([0, 2], tf.int32),
+                        tf.zeros([0], tf.int32), tf.zeros([0, 2, 2], self._dtype))
+            return tuple(tf.concat(items, axis=0) for items in (parents, pairs, mechanisms, fields))
 
         # [max_num_paths, num_sources, num_targets, 2, 3]
         mat_t = tf.zeros((paths.vertices[0].shape[2], paths.targets.shape[0], paths.sources.shape[0], 2, 2), dtype=self._dtype)
@@ -3473,18 +3515,23 @@ class DoubleDiffraction:
         return matrices * -tf.cast(spreading[:, None, None], self._dtype)
 
     def compute_fields_vertex_wedge(self, relative_permittivity, scattering_coefficient,
-                                    paths: Paths, paths_tmp: PathsTmpData, transmission=False):
+                                    paths: Paths, paths_tmp: PathsTmpData, transmission=False,
+                                    debug_resolve_edges=False):
         """Reuse the EV calculation through the existing path reversal convention."""
         reversed_paths, reversed_tmp = invert_s_t(paths, paths_tmp)
         matrices = self.compute_fields_wedge_vertex(
             relative_permittivity, scattering_coefficient, reversed_paths, reversed_tmp,
-            transmission=transmission, reverse_junction=True,
+            transmission=transmission, reverse_junction=True, debug_resolve_edges=debug_resolve_edges,
         )
+        if debug_resolve_edges:
+            parent, pairs, fields = matrices
+            # Restore TX -> RX order and original target/source indices.
+            return tf.gather(parent, [1, 0, 2], axis=1), tf.reverse(pairs, axis=[1]), fields
         return tf.transpose(matrices, perm=[1, 0, 2, 3, 4])
 
     def compute_fields_wedge_vertex(self, relative_permittivity, scattering_coefficient,
                                     paths: Paths, paths_tmp: PathsTmpData, transmission=False,
-                                    reverse_junction=False):
+                                    reverse_junction=False, debug_resolve_edges=False):
         solver = self.solver_paths
         scene = solver._scene
         vd = solver.vertex_diffraction
@@ -3500,6 +3547,8 @@ class DoubleDiffraction:
 
         indices = tf.cast(tf.where(vertex_wedge_mask & paths.mask[..., None]), tf.int32)
         if tf.shape(indices)[0] == 0:
+            if debug_resolve_edges:
+                return indices[:, :3], tf.zeros([0, 2], tf.int32), tf.zeros([0, 2, 2], self._dtype)
             return tf.zeros(output_shape, dtype=self._dtype)
 
         # Each row selects one constituent edge of one EV path.
@@ -3669,6 +3718,10 @@ class DoubleDiffraction:
             has_junction = junction1 | junction2
             matrices = tf.where(has_junction[:, None, None], tf.linalg.matrix_transpose(matrices), matrices)
 
+        if debug_resolve_edges:
+            pairs = tf.stack([tf.cast(edge_ids, tf.int32), tf.cast(vertex_edge_ids, tf.int32)], axis=1)
+            return path_indices, pairs, matrices
+
         path_ids = (path_indices[:, 0] * path_shape[1] + path_indices[:, 1]) * path_shape[2] + path_indices[:, 2]
         matrices = tf.math.unsorted_segment_sum(matrices, path_ids, tf.reduce_prod(path_shape))
         matrices = tf.reshape(matrices, output_shape)
@@ -3783,8 +3836,8 @@ class DoubleDiffraction:
         sin_alpha = tf.sin(alpha)
 
         # Keep the physical angular sector for both radial contour branches.
-        NUM_THETA = 201
-        THETA_EPS = 1e-5
+        NUM_THETA = 301
+        THETA_EPS = 1e-6
         span = tf.cast(PI, rdtype) - alpha
         # tf.debugging.assert_greater(
         #     span, tf.cast(2.0 * THETA_EPS, rdtype),

@@ -2115,7 +2115,7 @@ class Reflection:
         return mat_t if transfer is None else tf.matmul(mat_t, transfer)
 
     def _apply_diffraction_transmission(self, paths, paths_tmp, mat_t,
-                                        relative_permittivity, thickness):
+                                        relative_permittivity, thickness, path_indices=None):
         incoming = self._segment_transmission_operator(
             paths, paths_tmp, relative_permittivity, thickness, segment=0, diffraction=True
         )
@@ -2123,7 +2123,11 @@ class Reflection:
             paths, paths_tmp, relative_permittivity, thickness, segment=1, diffraction=True
         )
         if incoming is not None:
+            if path_indices is not None:
+                incoming = tf.gather_nd(incoming, path_indices)
             mat_t = tf.matmul(mat_t, incoming)
         if outgoing is not None:
+            if path_indices is not None:
+                outgoing = tf.gather_nd(outgoing, path_indices)
             mat_t = tf.matmul(outgoing, mat_t)
         return mat_t

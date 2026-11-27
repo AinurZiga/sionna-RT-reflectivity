@@ -1,3 +1,4 @@
-recursive-include ./sionna *.csv *.npy *.npz *.json *.xml *.ply
+recursive-include ./sionna *.csv *.npy *.json *.xml *.ply
+include tools/ev_integrals.py tools/generate_ev_table.py
+global-exclude *.npz
 prune test
-
