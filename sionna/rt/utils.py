@@ -286,77 +286,69 @@ def normalize(v):
     norm = tf.squeeze(norm, axis=-1)
     return n_v, norm
 
-def moller_trumbore(o, d, p0, p1, p2, epsilon):
+def moller_trumbore(o, d, p0, p1, p2, epsilon, barycentric_epsilon=None):
     r"""
-    Computes the intersection between a ray ``ray`` and a triangle defined
-    by its vertices ``p0``, ``p1``, and ``p2`` using the Moller–Trumbore
-    intersection algorithm.
+    Compute ray-triangle intersections using the Moller-Trumbore algorithm.
 
     Input
-    -----
-    o, d: [..., 3], tf.float
-        Ray origin and direction.
-        The direction `d` must be a unit vector.
+    ------
+    o : [..., 3], tf.float
+        Ray origins.
 
-    p0, p1, p2: [..., 3], tf.float
-        Vertices defining the triangle
+    d : [..., 3], tf.float
+        Unit ray directions.
 
-    epsilon : (), tf.float
-        Small value used to avoid errors due to numerical precision
+    p0, p1, p2 : [..., 3], tf.float
+        Vertices defining the triangles.
+
+    epsilon : float or scalar tf.Tensor
+        Minimum accepted intersection distance, in scene length units.
+        Also used as the dimensionless triangle boundary tolerance when
+        barycentric_epsilon is None, preserving the original behavior.
+
+    barycentric_epsilon : float, scalar tf.Tensor, or None
+        Dimensionless tolerance for triangle boundary checks.
+        If None, uses epsilon. Set to 0 for strict boundary checks.
 
     Output
     -------
     t : [...], tf.float
-        Position along the ray from the origin at which the intersection
-        occurs (if any)
+        Distance along each ray to the intersection.
+        Values corresponding to hit=False must be ignored.
 
-    hit : [...], bool
-        `True` if the ray intersects the triangle. `False` otherwise.
+    hit : [...], tf.bool
+        True if the intersection passes the triangle boundary and distance
+        checks and the ray is not parallel to the triangle.
     """
 
     rdtype = o.dtype
-    zero = tf.cast(0.0, rdtype)
+    zero = tf.zeros((), rdtype)
     one = tf.ones((), rdtype)
+    distance_epsilon = tf.cast(epsilon, rdtype)
+    boundary_epsilon = tf.cast(
+        epsilon if barycentric_epsilon is None else barycentric_epsilon, rdtype
+    )
 
-    # [..., 3]
     e1 = p1 - p0
     e2 = p2 - p0
-
-    # [...,3]
     pvec = cross(d, e2)
-    # [...,1]
     det = dot(e1, pvec, keepdim=True)
 
-    # If the ray is parallel to the triangle, then det = 0.
-    hit = tf.greater(tf.abs(det), zero)
+    # Keep the original parallel-ray criterion.
+    hit = tf.abs(det) > zero
 
-    # [...,3]
     tvec = o - p0
-    # [...,1]
     u = tf.math.divide_no_nan(dot(tvec, pvec, keepdim=True), det)
-    # [...,1]
-    hit = tf.logical_and(hit,
-        tf.logical_and(tf.greater_equal(u, -epsilon),
-                       tf.less_equal(u, one + epsilon)))
+    hit &= (u >= -boundary_epsilon) & (u <= one + boundary_epsilon)
 
-    # [..., 3]
     qvec = cross(tvec, e1)
-    # [...,1]
     v = tf.math.divide_no_nan(dot(d, qvec, keepdim=True), det)
-    # [..., 1]
-    hit = tf.logical_and(hit,
-                            tf.logical_and(tf.greater_equal(v, -epsilon),
-                                        tf.less_equal(u + v, one + epsilon)))
-    # [..., 1]
+    hit &= (v >= -boundary_epsilon) & (u + v <= one + boundary_epsilon)
+
     t = tf.math.divide_no_nan(dot(e2, qvec, keepdim=True), det)
-    # [..., 1]
-    hit = tf.logical_and(hit, tf.greater_equal(t, epsilon))
+    hit &= t >= distance_epsilon
 
-    # [...]
-    t = tf.squeeze(t, axis=-1)
-    hit = tf.squeeze(hit, axis=-1)
-
-    return t, hit
+    return tf.squeeze(t, axis=-1), tf.squeeze(hit, axis=-1)
 
 def component_transform(e_s, e_p, e_i_s, e_i_p):
     """
@@ -523,6 +515,96 @@ def reflection_coefficient(eta, cos_theta):
     d = b
     r_tm = tf.math.divide_no_nan(c-d, c+d)
     return r_te, r_tm
+
+def slab_coefficients(eta, cos_theta_i, thickness, wavelength, dtype=tf.complex64):
+    r"""Compute reflection and transmission of an air-material-air slab.
+
+    Parameters
+    ----------
+    eta : tf.Tensor, complex
+        Relative permittivity with the passive convention Im(eta) <= 0.
+    cos_theta_i : tf.Tensor, real
+        Cosine of the incidence angle in air.
+    thickness : tf.Tensor, real
+        Thickness along the surface normal [m].
+    wavelength : tf.Tensor, real
+        Free-space wavelength [m].
+    dtype : tf.DType
+        Complex computation dtype.
+
+    Returns
+    -------
+    r_s, r_p : tf.Tensor, complex
+        Slab reflection coefficients in the same polarization convention
+        as reflection_coefficient().
+    t_s, t_p : tf.Tensor, complex
+        Slab transmission coefficients relative to propagation through air
+        between the same reference planes.
+
+    Notes
+    -----
+    Inputs must be broadcast-compatible. Internal reflections are included.
+    At zero thickness, reflection is zero and transmission is one.
+    """
+    dtype = tf.as_dtype(dtype)
+    rdtype = dtype.real_dtype
+
+    eta = tf.cast(eta, dtype)
+    thickness = tf.cast(thickness, rdtype)
+    wavelength = tf.cast(wavelength, rdtype)
+    cos_theta_i = tf.cast(cos_theta_i, rdtype)
+
+    # Preserve the grazing-incidence guard used by the existing slab model.
+    c = tf.clip_by_value(cos_theta_i, tf.cast(1e-7, rdtype), tf.cast(1.0, rdtype))
+    c = tf.cast(c, dtype)
+    q = tf.sqrt(eta - 1.0 + c**2)
+
+    # Select the passive branch for exp(-j*k*z).
+    q = tf.where(tf.math.imag(q) > 0.0, -q, q)
+
+    kd = tf.cast(2.0 * PI * thickness / wavelength, dtype)
+    round_trip_minus_one = tf.math.expm1(-2j * kd * q)
+    relative_propagation = tf.exp(-1j * kd * (q - c))
+
+    def coefficients(a, b):
+        """Evaluate one polarization without subtracting nearly equal phases."""
+        interface_r = (a - b) / (a + b)
+
+        # Evaluate 1 - interface_r**2 without cancellation near |r| = 1.
+        interface_t_product = 4.0 * a * b / (a + b)**2
+        denominator = interface_t_product - interface_r**2 * round_trip_minus_one
+
+        slab_r = -interface_r * round_trip_minus_one / denominator
+        slab_t = interface_t_product * relative_propagation / denominator
+        return slab_r, slab_t
+
+    r_s, t_s = coefficients(c, q)
+    r_p, t_p = coefficients(eta * c, q)
+    return r_s, r_p, t_s, t_p
+
+def material_reflection_coefficients(eta, cos_theta_i, thickness,
+                                     transmission_enabled, wavelength):
+    """Select half-space or finite-slab reflection coefficients.
+
+    All inputs must have the same non-scalar batch shape.
+    The complex computation dtype is taken from eta.
+    """
+    r_s, r_p = reflection_coefficient(eta, cos_theta_i)
+    indices = tf.where(transmission_enabled)
+
+    # Evaluate slab coefficients only where explicitly enabled.
+    if tf.shape(indices)[0] > 0:
+        slab_r_s, slab_r_p, _, _ = slab_coefficients(
+            eta=tf.gather_nd(eta, indices),
+            cos_theta_i=tf.gather_nd(cos_theta_i, indices),
+            thickness=tf.gather_nd(thickness, indices),
+            wavelength=wavelength,
+            dtype=eta.dtype,
+        )
+        r_s = tf.tensor_scatter_nd_update(r_s, indices, slab_r_s)
+        r_p = tf.tensor_scatter_nd_update(r_p, indices, slab_r_p)
+
+    return r_s, r_p
 
 def paths_to_segments(paths):
     """

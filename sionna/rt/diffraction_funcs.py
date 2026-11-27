@@ -7,6 +7,7 @@ import drjit as dr
 import tensorflow as tf
 import trimesh
 from typing import Tuple, TYPE_CHECKING
+from functools import cached_property
 
 from sionna.constants import SPEED_OF_LIGHT, PI
 from sionna.utils.tensors import expand_to_rank, insert_dims, flatten_dims,\
@@ -24,15 +25,60 @@ CALC = 'TF'  # ['TF, 'Umul']
 ######################################
 
 class DiffractionTables:
-    def __init__(self, dtype=tf.complex64):
-        self.dtype = dtype
+    """Load the GFI lookup and retain paths to the EV transition tables."""
+
+    def __init__(self, dtype=tf.complex64, use_gfi_lookup=True, gfi_filename=None, ev_filename=None):
+        self.dtype = tf.as_dtype(dtype)
+        data_dir = Path(__file__).resolve().parent / "data"
+
         self.gfi_DIV = 0.0025
-        file_gfi_table = Path(__file__).resolve().parent / "data" / "gfi_00025.npy"
-        self.gfi_table_tf = tf.convert_to_tensor(np.load(file_gfi_table), dtype=dtype)
+        self.gfi_table_tf = None
+        self.gfi_lookup = None
 
-        self.file_T_ev_1 = Path(__file__).resolve().parent / "data" / "T_ev_even_linear_table.npz"
-        self.file_T_ev_2 = Path(__file__).resolve().parent / "data" / "T_ev_odd_linear_table.npz"
+        if use_gfi_lookup:
+            file_gfi_table = data_dir / "gfi_00025.npy" if gfi_filename is None else Path(gfi_filename)
 
+            if file_gfi_table.suffix == ".npy":
+                self.gfi_table_tf = tf.convert_to_tensor(
+                    np.load(file_gfi_table, allow_pickle=False), dtype=self.dtype
+                )
+            elif file_gfi_table.suffix == ".npz":
+                self.gfi_lookup = GFILookup(file_gfi_table, dtype=self.dtype)
+            else:
+                raise ValueError(f"Unsupported GFI table format: {file_gfi_table}")
+
+        self.file_T_ev = (
+            data_dir / "ev_manual_22.npz"
+            if ev_filename is None
+            else Path(ev_filename).expanduser()
+        )
+
+    @cached_property
+    def ev_transition(self):
+        """Load the EV interpolator on first use."""
+        try:
+            with np.load(self.file_T_ev, allow_pickle=False) as data:
+                axes = [
+                    data[key]
+                    for key in ("alpha_nodes", "beta_nodes", "chi_nodes", "w_nodes")
+                ]
+                low = np.stack(
+                    [data["R_e_T"], data["R_o_0"]], axis=-1
+                ).reshape(-1, 2)
+                phase = np.stack(
+                    [data["R_e_H"], data["R_A"], data["R_o_B"]], axis=-1
+                ).reshape(-1, 3)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"EV table not found: {self.file_T_ev}. "
+                "From the repository root, run: python tools/generate_ev_table.py"
+            ) from exc
+
+        with tf.init_scope():
+            return EVInterpolator(
+                axes, low, phase, transition_func, slope_transition_func,
+                real_dtype=self.dtype.real_dtype,
+            )
 
 def calc_angles(n_0_hat, e_hat, s_prime_hat, s_hat):
     r"""
@@ -105,83 +151,230 @@ def calc_angles_concave(n_0_hat, e_hat, s_prime_hat, s_hat, n):
 
     return my_phi_prime, my_phi, beta_prime, beta
 
-def t_gfi_full_approximated_capolino(b, a, table: DiffractionTables=None):  # x, y
-    x = tf.math.sqrt(b)
-    y = tf.math.sqrt(a)
+def cot_transition_stable(beta, n, k_ell, plus=True):
+    r"""
+    Evaluate cot((pi +/- beta)/(2*n)) * F(k_ell * a) jointly.
 
-    func_G = func_G_approximated_capolino(x, y, table) 
+    The expression is rearranged to avoid cancellation between singular
+    derivatives of the cotangent and the transition function near a boundary.
 
-    eps = 1e-8
-    res = func_G * tf.complex(tf.cast(0.0, x.dtype), 4*PI * tf.math.sqrt(b / (a + eps)) * (a + b))
+    Parameters
+    ----------
+    beta : tf.Tensor, real
+        Angular argument: phi - phi_prime or phi + phi_prime.
+    n : tf.Tensor, real
+        Wedge parameter. Must be positive.
+    k_ell : tf.Tensor, real
+        Nonnegative transition scale k * ell.
+    plus : bool
+        Select the plus or minus UTD term.
 
-    return res
+    Returns
+    -------
+    tf.Tensor, complex
+        Joint cotangent-transition product, with broadcast input shape.
+        At delta=0, the positive one-sided value is selected. This convention
+        does not resolve consistency with the GO boundary classification.
+    """
 
-def func_G_approximated_capolino(x, y, table: DiffractionTables=None):
-    initial_shape = tf.shape(x)
-    x = tf.reshape(x, [-1])
-    y = tf.reshape(y, [-1])
-    gfi_sign = sign(x) * sign(y)
-    x = tf.math.abs(x)
-    y = tf.math.abs(y)
+    beta = tf.convert_to_tensor(beta)
+    n = tf.cast(n, beta.dtype)
+    k_ell = tf.cast(k_ell, beta.dtype)
+    pi = tf.constant(PI, dtype=beta.dtype)
 
-    if table is not None:
-        _func_G = _func_G_table2(x, y, table)  # default to table2
+    # Use the same branch selection as the original a_p/a_m functions.
+    if plus:
+        turns = tf.round((beta + pi) / (2.0 * n * pi))
+        delta = beta + pi - 2.0 * n * pi * turns
     else:
-        _func_G = _func_G_approximated_capolino2(x, y)  # fast non-table implementation
+        turns = tf.round((beta - pi) / (2.0 * n * pi))
+        delta = pi - beta + 2.0 * n * pi * turns
 
-    res = tf.complex(gfi_sign, tf.cast(0.0, x.dtype)) * _func_G
-    res = tf.reshape(res, initial_shape)
+    def sinc_unscaled(x):
+        # sin(x)/x, including a stable derivative near zero.
+        small = tf.abs(x) < tf.cast(1e-2, x.dtype)
+        x2 = tf.square(x)
+        series = 1.0 - x2 / 6.0 + x2**2 / 120.0 - x2**3 / 5040.0
+        safe_x = tf.where(small, tf.ones_like(x), x)
+        regular = tf.sin(safe_x) / safe_x
+        return tf.where(small, series, regular)
 
-    return res
+    half_delta = 0.5 * delta
+    cot_angle = half_delta / n
+    scale = tf.sqrt(2.0 * k_ell)
+    sqrt_x = scale * tf.abs(tf.sin(half_delta))
+
+    side = tf.where(delta >= 0.0, tf.ones_like(delta), -tf.ones_like(delta))
+    ratio = sinc_unscaled(half_delta) / sinc_unscaled(cot_angle)
+    amplitude = scale * n * side * ratio * tf.cos(cot_angle)
+
+    q = fresnel_integral_capolino(tf.complex(sqrt_x, tf.zeros_like(sqrt_x)), sqrt_x)
+    return tf.complex(tf.zeros_like(amplitude), 2.0 * amplitude) * q
+
+def t_gfi_full_approximated_capolino(b, a, table: DiffractionTables = None):
+    r"""
+    Evaluate the normalized GFI transition function T(b, a).
+
+    Near a=0 with b>0, use a first-order expansion to avoid the indeterminate
+    product G(sqrt(b), sqrt(a)) * sqrt(b/a).
+
+    Parameters
+    ----------
+    b, a : tf.Tensor, real
+        Broadcast-compatible arguments. Requires b>0 and a>=0.
+    table : DiffractionTables or None
+        Optional GFI lookup table for the regular branch.
+
+    Returns
+    -------
+    tf.Tensor, complex
+        Transition function with the broadcast input shape.
+
+    Notes
+    -----
+    The small-a expansion preserves the limiting value and the first
+    derivative with respect to a at a=0.
+    The joint limit a=b=0 and the boundary b=0 are not handled.
+    """
+
+    b = tf.convert_to_tensor(b)
+    a = tf.cast(a, b.dtype)
+    tf.debugging.assert_positive(b, message="T_GFI: b=0 requires a separate limit.")
+    tf.debugging.assert_greater_equal(a, tf.zeros_like(a), message="T_GFI: a must be nonnegative.")
+
+    output_dtype = tf.complex128 if b.dtype == tf.float64 else tf.complex64
+    output_shape = tf.broadcast_dynamic_shape(tf.shape(b), tf.shape(a))
+    b = tf.reshape(tf.broadcast_to(b, output_shape), [-1])
+    a = tf.reshape(tf.broadcast_to(a, output_shape), [-1])
+
+    # Require both a/b and a to be small.
+    expansion_limit = tf.cast(1e-4, b.dtype) * tf.minimum(b, tf.ones_like(b))
+    small = a <= expansion_limit
+    small_idx = tf.where(small)[:, 0]
+    regular_idx = tf.where(~small)[:, 0]
+
+    # Evaluate only the selected branch, avoiding inactive 0/0 operations.
+    b_small = tf.gather(b, small_idx)
+    a_small = tf.gather(a, small_idx)
+
+    # Local double precision protects the subtraction 1-F(b).
+    b64 = tf.cast(b_small, tf.float64)
+    a64 = tf.cast(a_small, tf.float64)
+    f = transition_func(b64)
+    one_minus_f = tf.ones_like(f) - f
+
+    t0 = tf.complex(tf.zeros_like(b64), 2.0 * b64) * one_minus_f
+    t1 = (
+        tf.complex(tf.zeros_like(b64), 2.0 * tf.ones_like(b64)) * (2.0 / 3.0 - f)
+        - tf.cast((4.0 / 3.0) * b64, f.dtype) * one_minus_f
+    )
+    small_values = t0 + tf.cast(a64, f.dtype) * t1
+
+    b_regular = tf.gather(b, regular_idx)
+    a_regular = tf.gather(a, regular_idx)
+    x = tf.sqrt(b_regular)
+    y = tf.sqrt(a_regular)
+
+    g = func_G_approximated_capolino(x, y, table)
+    multiplier = 4.0 * PI * (x / y) * (a_regular + b_regular)
+    regular_values = g * tf.cast(
+        tf.complex(tf.zeros_like(multiplier), multiplier), g.dtype
+    )
+
+    result = tf.zeros(tf.shape(b), dtype=output_dtype)
+    result = tf.tensor_scatter_nd_update(
+        result, small_idx[:, None], tf.cast(small_values, output_dtype)
+    )
+    result = tf.tensor_scatter_nd_update(
+        result, regular_idx[:, None], tf.cast(regular_values, output_dtype)
+    )
+    return tf.reshape(result, output_shape)
+
+def func_G_approximated_capolino(x, y, table: DiffractionTables = None):
+    r"""
+    Evaluate GFI for real, broadcast-compatible arguments.
+
+    Parameters
+    ----------
+    x, y : tf.Tensor, real
+        GFI arguments. Signed arguments use odd extension in each variable.
+    table : DiffractionTables or None
+        Shared tables. If the GFI lookup is disabled, evaluate the existing
+        analytical approximations directly.
+
+    Returns
+    -------
+    tf.Tensor, complex
+        GFI values with the broadcast input shape.
+
+    Notes
+    -----
+    The lookup performs its own sign extension and shape handling.
+    Its joint-origin and domain restrictions remain applicable.
+    """
+
+    lookup = None if table is None else table.gfi_lookup
+    if lookup is not None:
+        return lookup(x, y)
+
+    x = tf.convert_to_tensor(x)
+    y = tf.cast(y, x.dtype)
+    initial_shape = tf.broadcast_dynamic_shape(tf.shape(x), tf.shape(y))
+    x = tf.reshape(tf.broadcast_to(x, initial_shape), [-1])
+    y = tf.reshape(tf.broadcast_to(y, initial_shape), [-1])
+
+    gfi_sign = sign(x) * sign(y)
+
+    # values = _func_G_approximated_capolino2(tf.abs(x), tf.abs(y))
+    # values *= tf.cast(gfi_sign, values.dtype)
+
+    if table is not None and table.gfi_table_tf is not None:
+        x_abs = tf.cast(tf.abs(x), table.dtype.real_dtype)
+        y_abs = tf.cast(tf.abs(y), table.dtype.real_dtype)
+        values = _func_G_table2(x_abs, y_abs, table)
+    else:
+        values = _func_G_approximated_capolino2(tf.abs(x), tf.abs(y))
+
+    values *= tf.cast(gfi_sign, values.dtype)
+
+    return tf.reshape(values, initial_shape)
+
+def _func_G_table2_regular(x, y, table: DiffractionTables):
+    """Interpolate nonnegative arguments on the uniform GFI grid."""
+    values = table.gfi_table_tf
+    div = tf.cast(table.gfi_DIV, x.dtype)
+    gx, gy = x / div, y / div
+
+    i = tf.clip_by_value(tf.cast(tf.floor(gx), tf.int32), 0, tf.shape(values)[0] - 2)
+    j = tf.clip_by_value(tf.cast(tf.floor(gy), tf.int32), 0, tf.shape(values)[1] - 2)
+
+    u, v = gx - tf.cast(i, x.dtype), gy - tf.cast(j, y.dtype)
+    return GFILookup._bilinear(values, i, j, u, v)
+
 
 def _func_G_table2(x, y, table: DiffractionTables):
-    dtype = table.dtype
-    table_tf = table.gfi_table_tf
-    DIV = table.gfi_DIV
+    """Evaluate GFI for flat, nonnegative arguments in three regions."""
+    small = (x <= 0.4) & (y <= 0.4)
+    large = (x >= 3.0) | (y >= 3.0)
+    middle = ~(small | large)
 
-    cond_approx1_idxs = tf.where(tf.math.logical_or(x >= 3.0, y >= 3.0))[:, 0]
-    table_cond_idxs = tf.where(tf.math.logical_and(x < 3.0, y < 3.0))[:, 0]
+    def select(mask):
+        idx = tf.cast(tf.where(mask)[:, 0], tf.int32)
+        return idx, tf.gather(x, idx), tf.gather(y, idx)
 
-    def _from_table(x_table, y_table):
-        x_idx = tf.cast(tf.math.floor(x_table / DIV), tf.int32)
-        y_idx = tf.cast(tf.math.floor(y_table / DIV), tf.int32)
-        ##
-        x_idx = tf.where(x_idx < 0, tf.zeros_like(x_idx), x_idx)
-        x_idx = tf.where(x_idx >= tf.shape(table_tf)[0]-2, tf.zeros_like(x_idx), x_idx)
-        y_idx = tf.where(y_idx < 0, tf.zeros_like(y_idx), y_idx)
-        y_idx = tf.where(y_idx >= tf.shape(table_tf)[1]-2, tf.zeros_like(y_idx), y_idx)
-        ##
-        idxs = tf.stack([x_idx, y_idx], axis=-1)
-        idxs_10 = tf.stack([x_idx + 1, y_idx], axis=-1)
-        idxs_01 = tf.stack([x_idx, y_idx + 1], axis=-1)
-        idxs_11 = tf.stack([x_idx + 1, y_idx + 1], axis=-1)
+    i_small, xs, ys = select(small)
+    i_middle, xm, ym = select(middle) # bilinear interpolation
+    i_large, xl, yl = select(large)
 
-        table_00 = tf.gather_nd(table_tf, idxs)
-        table_10 = tf.gather_nd(table_tf, idxs_10)
-        table_01 = tf.gather_nd(table_tf, idxs_01)
-        table_11 = tf.gather_nd(table_tf, idxs_11)
+    g_small = _func_G_reg1(tf.complex(xs, tf.zeros_like(xs)),
+                           tf.complex(ys, tf.zeros_like(ys)), xs, ys)
+    g_middle = _func_G_table2_regular(xm, ym, table)
+    g_large = G_approx1(xl, yl)
 
-        # bilinear interpolation
-        x1 = tf.cast(x_idx, x.dtype) * DIV
-        x2 = tf.cast(x_idx + 1, x.dtype) * DIV
-        y1 = tf.cast(y_idx, x.dtype) * DIV
-        y2 = tf.cast(y_idx + 1, x.dtype) * DIV
-        res = table_00 * tf.cast((x2 - x_table)/DIV, dtype) * tf.cast((y2 - y_table)/DIV, dtype) + \
-                table_10 * tf.cast((x_table - x1)/DIV, dtype) * tf.cast((y2 - y_table)/DIV, dtype) + \
-                table_01 * tf.cast((x2 - x_table)/DIV, dtype) * tf.cast((y_table - y1)/DIV, dtype) + \
-                table_11 * tf.cast((x_table - x1)/DIV, dtype) * tf.cast((y_table - y1)/DIV, dtype)
-        
-        return res
-
-    res_approx1 = G_approx1(tf.gather(x, cond_approx1_idxs), tf.gather(y, cond_approx1_idxs))
-    res_table_cond = _from_table(tf.gather(x, table_cond_idxs), tf.gather(y, table_cond_idxs))
-
-    res = tf.zeros([tf.shape(x)[0]], dtype=dtype)
-    res = tf.tensor_scatter_nd_update(res, tf.reshape(cond_approx1_idxs, (-1, 1)), res_approx1)
-    res = tf.tensor_scatter_nd_update(res, tf.reshape(table_cond_idxs, (-1, 1)), res_table_cond)
-    
-    return res
-
+    return tf.dynamic_stitch(
+        [i_small, i_middle, i_large],
+        [tf.cast(g_small, table.dtype), g_middle, tf.cast(g_large, table.dtype)],
+    )
 
 def _func_G_approximated_capolino2(x, y):
     # new and faster
@@ -219,16 +412,39 @@ def _func_G_approximated_capolino2(x, y):
     return res
 
 def _func_G_reg1(x, y, x_real, y_real):
-    imag_i = tf.complex(tf.cast(0.0, x_real.dtype), tf.cast(1.0, x_real.dtype))
-    sqrt_pi_complex = tf.complex(tf.math.sqrt(tf.cast(PI, dtype=x_real.dtype)), tf.cast(0.0, x_real.dtype))
+    r"""
+    Evaluate the small-argument GFI approximation.
 
-    tmp1 = 0.5 * tf.math.exp(imag_i * x*x)
-    fr_integral = fresnel_integral_capolino(y, y_real) / sqrt_pi_complex
-    tmp2 = tf.math.exp(imag_i * PI / 4) * fr_integral 
-    tmp3 = ((1 + imag_i * y*y) * tf.math.atan(x / y) 
-            - imag_i * x * y) / PI
+    Parameters
+    ----------
+    x, y : tf.Tensor, complex
+        Complex representations of the nonnegative real arguments.
+    x_real, y_real : tf.Tensor, real
+        Corresponding real arguments, with matching shapes.
 
-    return tmp1 * (tmp2 - tmp3)
+    Returns
+    -------
+    tf.Tensor, complex
+        Small-argument GFI approximation.
+
+    Notes
+    -----
+    atan2(x_real, y_real) replaces atan(x/y) for nonnegative real arguments.
+    The joint origin has direction-dependent limits; atan2(0, 0) does not
+    resolve that physical ambiguity.
+    """
+
+    pi = tf.constant(PI, dtype=x_real.dtype)
+    imag_i = tf.complex(tf.zeros_like(x_real), tf.ones_like(x_real))
+    sqrt_pi = tf.cast(tf.sqrt(pi), x.dtype)
+
+    # Preserve the angular dependence without dividing by a small y.
+    angle = tf.cast(tf.math.atan2(x_real, y_real), x.dtype)
+    phase = tf.exp(imag_i * tf.cast(pi / 4.0, x.dtype))
+    fresnel = fresnel_integral_capolino(y, y_real) / sqrt_pi
+
+    term = ((1.0 + imag_i * y**2) * angle - imag_i * x * y) / tf.cast(pi, x.dtype)
+    return 0.5 * tf.exp(imag_i * x**2) * (phase * fresnel - term)
 
 def _func_G_reg2(x, y, x_real, y_real):
     imag_i = tf.complex(tf.cast(0.0, x_real.dtype), tf.cast(1.0, x_real.dtype))
@@ -1238,141 +1454,266 @@ def clear_vd_coef(d, mask_wedges_in_vertex, dtype):
 
     return res
 
-class LinearTEVTF:
-    def __init__(self, table_path, transition_func, slope_transition_func, case="even", real_dtype=tf.float32):
-        data = np.load(table_path)
 
-        self.real_dtype = real_dtype
-        self.complex_dtype = tf.complex64 if real_dtype == tf.float32 else tf.complex128
-        self.case = case
-        self.transition_func = transition_func
-        self.slope_transition_func = slope_transition_func
+#########################
+# Tables
 
-        self.alpha_nodes = tf.constant(data["alpha_nodes"], dtype=real_dtype)
-        self.beta_nodes = tf.constant(data["beta_nodes"], dtype=real_dtype)
-        self.chi_nodes = tf.constant(data["chi_nodes"], dtype=real_dtype)
-        self.w_nodes = tf.constant(data["w_nodes"], dtype=real_dtype)
-        self.values = tf.constant(data["values"], dtype=self.complex_dtype)
+"""Two-region lookup for the shared GFI G(x, y), used by VD and EE."""
+from pathlib import Path
 
-        self.alpha_max = self.alpha_nodes[-1]
-        self.beta_min = self.beta_nodes[0]
-        self.beta_max = self.beta_nodes[-1]
-        self.chi_max = self.chi_nodes[-1]
-        self.w_min = self.w_nodes[0]
-        self.w_max = self.w_nodes[-1]
+class GFILookup:
+    """Bilinear GFI interpolation; slopes may jump at cell and region boundaries.
+
+    The first quadrant uses the positive one-sided limits on its axes. The
+    joint origin is rejected because its value depends on approach direction.
+    Tables approximate the generating formulas, not an exact quadrature oracle.
+    """
+
+    def __init__(self, filename, dtype=tf.complex64):
+        self.dtype = tf.as_dtype(dtype)
+        self.rdtype = self.dtype.real_dtype
+        with np.load(Path(filename), allow_pickle=False) as data:
+            if int(data['format_version']) != 1:
+                raise ValueError('Unsupported GFI table format.')
+            self.region = tf.constant(float(data['region']), self.rdtype)
+            for name in ('r_nodes', 'theta_nodes', 'x_nodes', 'y_nodes'):
+                nodes = data[name]
+                if len(nodes) < 2 or not np.all(np.diff(nodes) > 0):
+                    raise ValueError(f'{name} must be strictly increasing.')
+                setattr(self, name, tf.constant(nodes, self.rdtype))
+            self.polar = tf.constant(data['polar'], self.dtype)
+            self.cartesian = tf.constant(data['cartesian'], self.dtype)
+        if tuple(self.polar.shape) != (len(self.r_nodes), len(self.theta_nodes)):
+            raise ValueError('Invalid polar table shape.')
+        if tuple(self.cartesian.shape) != (len(self.x_nodes), len(self.y_nodes)):
+            raise ValueError('Invalid Cartesian table shape.')
+        self.theta_step = self.theta_nodes[1] - self.theta_nodes[0]
 
     @staticmethod
     def _find_interval(x, nodes):
-        """Return the interval index and linear interpolation coordinate."""
-        num_nodes = tf.shape(nodes)[0]
-        i = tf.searchsorted(nodes, x, side="right") - 1
-        i = tf.clip_by_value(i, 0, num_nodes - 2)
-
-        x0 = tf.gather(nodes, i)
-        x1 = tf.gather(nodes, i + 1)
-        t = tf.clip_by_value((x - x0) / (x1 - x0), 0.0, 1.0)
-        return i, t
-
-    def _interpolate(self, alpha, beta, chi, w):
-        alpha = tf.clip_by_value(alpha, self.alpha_nodes[0], self.alpha_max)
-        beta = tf.clip_by_value(beta, self.beta_min, self.beta_max)
-        chi = tf.clip_by_value(chi, self.chi_nodes[0], self.chi_max)
-        w = tf.clip_by_value(w, self.w_min, self.w_max)
-
-        ia, ta = self._find_interval(alpha, self.alpha_nodes)
-        ib, tb = self._find_interval(beta, self.beta_nodes)
-        ic, tc = self._find_interval(chi, self.chi_nodes)
-        iw, tw = self._find_interval(w, self.w_nodes)
-        result = tf.zeros_like(tf.cast(alpha, self.complex_dtype))
-
-        # Multilinear interpolation over 16 corners.
-        for da in range(2):
-            wa = ta if da else 1.0 - ta
-            for db in range(2):
-                wb = tb if db else 1.0 - tb
-                for dc in range(2):
-                    wc = tc if dc else 1.0 - tc
-                    for dw in range(2):
-                        ww = tw if dw else 1.0 - tw
-                        indices = tf.stack([ia + da, ib + db, ic + dc, iw + dw], axis=-1)
-                        corner_value = tf.gather_nd(self.values, indices)
-                        weight = wa * wb * wc * ww
-                        result += tf.cast(weight, self.complex_dtype) * corner_value
-
-        return result
+        """Find intervals on strictly increasing nonuniform nodes."""
+        i = tf.searchsorted(nodes, x, side='right') - 1
+        i = tf.clip_by_value(i, 0, tf.shape(nodes)[0] - 2)
+        x0, x1 = tf.gather(nodes, i), tf.gather(nodes, i + 1)
+        return i, tf.clip_by_value((x - x0) / (x1 - x0), 0.0, 1.0)
 
     @staticmethod
-    def _scatter_result(result, mask, updates):
-        return tf.tensor_scatter_nd_update(result, tf.where(mask), updates)
+    def _bilinear(values, i, j, u, v):
+        """Interpolate complex values; weights retain coordinate gradients."""
+        z00 = tf.gather_nd(values, tf.stack([i, j], axis=-1))
+        z10 = tf.gather_nd(values, tf.stack([i + 1, j], axis=-1))
+        z01 = tf.gather_nd(values, tf.stack([i, j + 1], axis=-1))
+        z11 = tf.gather_nd(values, tf.stack([i + 1, j + 1], axis=-1))
+        u, v = tf.cast(u, values.dtype), tf.cast(v, values.dtype)
+        return (1-u)*((1-v)*z00 + v*z01) + u*((1-v)*z10 + v*z11)
+
+    def __call__(self, x, y):
+        """Evaluate G for broadcast-compatible real tensors.
+
+        Signed arguments use odd extension in each variable. Exact zeros select
+        the positive side. No extrapolation or analytical fallback is performed.
+        At the joint origin, callers must handle the directional physical limit.
+        """
+        x, y = tf.cast(x, self.rdtype), tf.cast(y, self.rdtype)
+        shape = tf.broadcast_dynamic_shape(tf.shape(x), tf.shape(y))
+        x = tf.reshape(tf.broadcast_to(x, shape), [-1])
+        y = tf.reshape(tf.broadcast_to(y, shape), [-1])
+        side = tf.where(x < 0, -tf.ones_like(x), tf.ones_like(x))
+        side *= tf.where(y < 0, -tf.ones_like(y), tf.ones_like(y))
+        x, y = tf.abs(x), tf.abs(y)
+        tf.debugging.assert_all_finite(x, 'GFI x contains NaN/Inf.')
+        tf.debugging.assert_all_finite(y, 'GFI y contains NaN/Inf.')
+        tf.debugging.assert_positive(tf.maximum(x, y), message='GFI joint origin needs a directional limit.')
+        tf.debugging.assert_less_equal(x, self.x_nodes[-1], message='GFI x exceeds table range.')
+        tf.debugging.assert_less_equal(y, self.y_nodes[-1], message='GFI y exceeds table range.')
+
+        small = (x <= self.region) & (y <= self.region)
+        polar_idx, cart_idx = tf.where(small)[:, 0], tf.where(~small)[:, 0]
+        xp, yp = tf.gather(x, polar_idx), tf.gather(y, polar_idx)
+        r = tf.sqrt(tf.square(xp) + tf.square(yp))
+        theta = tf.math.atan2(yp, xp)
+        i, u = self._find_interval(r, self.r_nodes)
+        j = tf.cast(tf.floor(theta / self.theta_step), tf.int32)
+        j = tf.clip_by_value(j, 0, tf.shape(self.theta_nodes)[0] - 2)
+        v = tf.clip_by_value((theta - tf.gather(self.theta_nodes, j)) / self.theta_step, 0.0, 1.0)
+        polar_values = self._bilinear(self.polar, i, j, u, v)
+
+        xc, yc = tf.gather(x, cart_idx), tf.gather(y, cart_idx)
+        i, u = self._find_interval(xc, self.x_nodes)
+        j, v = self._find_interval(yc, self.y_nodes)
+        cart_values = self._bilinear(self.cartesian, i, j, u, v)
+        result = tf.zeros(tf.shape(x), self.dtype)
+        result = tf.tensor_scatter_nd_update(result, polar_idx[:, None], polar_values)
+        result = tf.tensor_scatter_nd_update(result, cart_idx[:, None], cart_values)
+        return tf.reshape(result * tf.cast(side, self.dtype), shape)
+
+
+class EVInterpolator:
+
+    def __init__(self, axes, low_fields, phase_fields, transition_func, slope_transition_func, real_dtype=tf.float32):
+        self._tf = tf
+        self.real_dtype = tf.as_dtype(real_dtype)
+        self.complex_dtype = tf.complex64 if self.real_dtype == tf.float32 else tf.complex128
+        self.transition_func = transition_func
+        self.slope_transition_func = slope_transition_func
+        self._axes = tuple((tf.convert_to_tensor(a, dtype=self.real_dtype) for a in axes))
+        self.grid_shape = tuple((int(a.shape[0]) for a in self._axes))
+        self._invgaps = tuple((1 / (a[1:] - a[:-1]) for a in self._axes))
+        self._lower = tf.stack([a[0] for a in self._axes])
+        self._upper = tf.stack([a[-1] for a in self._axes])
+        self._low_fields = tf.convert_to_tensor(low_fields, dtype=self.complex_dtype)
+        self._phase_fields = tf.convert_to_tensor(phase_fields, dtype=self.complex_dtype)
+        nb, nc, nw = self.grid_shape[1:]
+        self._strides = tf.constant([nb * nc * nw, nc * nw, nw, 1], tf.int32)
+        self._bits = tf.constant([[a, b, c, w] for a in range(2) for b in range(2) for c in range(2) for w in range(2)], tf.int32)
+        self._d = tf.constant(complex(0.7071067811865476, 0.7071067811865476), self.complex_dtype)
+        self._c1 = self._z(tf.sqrt(tf.constant(3.141592653589793, self.real_dtype))) * self._d
+        self._b1 = self._c1 / (4 - 3.141592653589793)
+        self._c2 = tf.constant(1j * (3 * 3.141592653589793 - 8) / (4 - 3.141592653589793), self.complex_dtype)
+        self._c3 = 2j * self._c1 * (3.141592653589793 - 3) / (4 - 3.141592653589793)
+        self._compiled = tf.function(self._evaluate_flat, input_signature=[tf.TensorSpec([None, 4], self.real_dtype)], autograph=False)
+
+    def _den(self, x):
+        z = self._z(x)
+        return 1 + z * (self._b1 + z * (self._c2 + z * self._c3))
+
+    def _phi(self, x):
+        z = self._z(x)
+        return z * (self._c1 + z * (self._c2 + z * self._c3)) / self._den(x)
+
+    def _sigma(self, x):
+        tf = self._tf
+        return tf.complex(tf.zeros_like(x), 2 * x * x) * (1 + (self._b1 - self._c1) * self._z(x)) / self._den(x)
+
+    def _psi(self, x, y):
+        tf = self._tf
+        rho = x * x / (x * x + y * y)
+        u = tf.complex(tf.zeros_like(x), 2 * x * (x * x + y * y) / y * tf.atan(y / x))
+        v = tf.complex(tf.zeros_like(x), 2 * x * x)
+        return u / (self._z(1 - rho) + (u - self._z(rho) * v) / self._phi(x) + self._z(rho) * v / self._sigma(x))
+
+    def _q_functions(self, a, b):
+        t, u = (self._z(a + b), self._z(a * b))
+        c1, b1, c2, c3 = (self._c1, self._b1, self._c2, self._c3)
+        pe = c1 * (1 + t * (b1 + t * (c2 + t * c3))) + u * (c2 * b1 - c3 - c1 * c2) + u * t * (c2 * c2 - 2 * c1 * c3) + c2 * c3 * u * t * t + c3 * c3 * u * u * t
+        dd = self._den(a) * self._den(b)
+        qe = u * pe / (t * dd)
+        po = c1 + c2 * t + c3 * (t * t - u) - (c1 - b1) * u * (c2 + c3 * t)
+        tf = self._tf
+        qo = tf.complex(tf.zeros_like(a), 2 * a * a * b * b / (a + b)) * po / dd
+        return (qe, qo)
+
+    def _cells(self, p):
+        tf = self._tf
+        indices, fractions = ([], [])
+        for j, axis in enumerate(self._axes):
+            last = self.grid_shape[j] - 2
+            i = tf.searchsorted(axis, p[:, j], side='right', out_type=tf.int32) - 1
+            i = tf.clip_by_value(i, 0, last)
+            t = (p[:, j] - tf.gather(axis, i)) * tf.gather(self._invgaps[j], i)
+            indices.append(i)
+            fractions.append(tf.clip_by_value(t, 0.0, 1.0))
+        idx = tf.stack(indices, axis=-1)
+        t = tf.stack(fractions, axis=-1)
+        corners = idx[:, None, :] + self._bits[None, :, :]
+        flat = tf.reduce_sum(corners * self._strides, axis=-1)
+        wt = tf.reduce_prod(tf.where(tf.cast(self._bits[None, :, :], tf.bool), t[:, None, :], 1 - t[:, None, :]), axis=-1)
+        return (flat, wt)
+
+    def _interpolate(self, fields, ids, weights):
+        tf = self._tf
+        return tf.reduce_sum(tf.gather(fields, ids) * self._z(weights[:, :, None]), axis=1)
+
+    def _low(self, p, ids, weights):
+        tf = self._tf
+        a, b, c, w = tf.unstack(p, axis=1)
+        q = (1 - w) * (1 + w)
+        rq = tf.sqrt(q)
+        qe, qo = self._q_functions(a, b)
+        pc = self._phi(c)
+        factor = 1 + q * c * c / (b * b)
+        pg = self._phi(a) * self._psi(c, b / rq) * self._z(tf.atan((b + a * w) / (c * rq)) / tf.atan(b / (c * rq)))
+        eta = a * a / (a * a + q)
+        nt = self._z(1 - eta) * pg + self._z(eta * factor) * pc * qe
+        m = pc * qo * self._z(factor) * self._phi((a + b) / rq)
+        scale = a / rq + b / (w * rq) + c / w
+        theta = tf.atan((q * c - w * b - w * w * a) / (rq * (b + w * a + w * c)))
+        j1 = self._d * self._z(3.141592653589793 ** 1.5 * w / q * (a + b) - 2 * 1.7724538509055159 * c / w)
+        g0 = self._z(-2 * theta / (3.141592653589793 * w))
+        g1 = self._z(-2 / (3.141592653589793 * w)) * (self._z(rq / 3.141592653589793) * j1 + self._d * self._z(2 * theta / 1.7724538509055159 * (c + a + b + (a + b) / rq)))
+        base = m * (g0 + g1 / self._z(1 + scale * scale))
+        n0 = m * self._z(scale * scale / (1 + scale * scale))
+        ip = self._interpolate(self._low_fields, ids, weights)
+        return tf.stack([nt * ip[:, 0], base + n0 * ip[:, 1]], axis=-1)
+
+    def _phase(self, p, ids, weights):
+        tf = self._tf
+        a, b, c, w = tf.unstack(p, axis=1)
+        q = (1 - w) * (1 + w)
+        rq = tf.sqrt(q)
+        common = self._psi(c, (b + a * w) / rq)
+        nh, nb = (self._phi(a) * common, self._sigma(a) * common)
+        x, y = (c / w, a / rq)
+        na = self._c1 * self._z(a * a * c * c * c / (x * (x * x + y * y))) * self._psi(x, y)
+        e = tf.exp(tf.complex(-2 * b * c * rq / (w * w), (b * b - q * c * c) / (w * w)))
+        v = w * w * q / (2 * (q + a * a))
+        ar = tf.sqrt((tf.sqrt(c * c * c * c + v * v) + c * c) / 2)
+        br = v / (2 * ar)
+        bc = tf.minimum(b, 0.999 * c * rq)
+        r = tf.complex(2 * rq * ar / (w * w), -(2 * rq * br + 2 * bc) / (w * w))
+        ip = self._interpolate(self._phase_fields, ids, weights)
+        amp = na * ip[:, 1]
+        return tf.stack([nh * ip[:, 0] + e * amp / self._z(b), nb * ip[:, 2] + e * r * amp], axis=-1)
+
+    def _z(self, x):
+        return tf.cast(x, self.complex_dtype)
+
+    def _grid(self, p):
+        p = tf.clip_by_value(p, self._lower, self._upper)
+        ids, weights = self._cells(p)
+        s = p[:, 2] ** 2 * (1 - p[:, 3]) * (1 + p[:, 3]) / p[:, 3] ** 2
+        mask = s < tf.cast(0.1, self.real_dtype)
+        ilow = tf.cast(tf.where(mask)[:, 0], tf.int32)
+        ihigh = tf.cast(tf.where(~mask)[:, 0], tf.int32)
+
+        def evaluate(indices, method):
+            return tf.cond(tf.size(indices) > 0, lambda: method(tf.gather(p, indices), tf.gather(ids, indices), tf.gather(weights, indices)), lambda: tf.zeros([0, 2], self.complex_dtype))
+        values = tf.concat([evaluate(ilow, self._low), evaluate(ihigh, self._phase)], axis=0)
+        indices = tf.concat([ilow, ihigh], axis=0)[:, None]
+        return tf.scatter_nd(indices, values, tf.stack([tf.shape(p)[0], 2]))
+
+    def _evaluate_flat(self, p):
+        large_chi = p[:, 2] > self._upper[2]
+        large_beta = ~large_chi & (p[:, 1] > self._upper[1])
+        grid = ~large_chi & ~large_beta
+
+        def chi_branch(x):
+            a2 = x[:, 0] ** 2
+            return tf.stack([self._z(self.transition_func(a2)), -self._z(self.slope_transition_func(a2))], axis=-1)
+
+        def beta_branch(x):
+            a2, c2 = (x[:, 0] ** 2, x[:, 2] ** 2)
+            fc = self._z(self.transition_func(c2))
+            return tf.stack([self._z(self.transition_func(a2)) * fc, self._z(self.slope_transition_func(a2)) * fc], axis=-1)
+        indices, values = ([], [])
+        for mask, method in [(large_chi, chi_branch), (large_beta, beta_branch), (grid, self._grid)]:
+            ix = tf.cast(tf.where(mask)[:, 0], tf.int32)
+            result = tf.cond(tf.size(ix) > 0, lambda ix=ix, method=method: method(tf.gather(p, ix)), lambda: tf.zeros([0, 2], self.complex_dtype))
+            indices.append(ix)
+            values.append(result)
+        return tf.scatter_nd(tf.concat(indices, axis=0)[:, None], tf.concat(values, axis=0), tf.stack([tf.shape(p)[0], 2]))
 
     def __call__(self, alpha, beta, chi, w):
-        alpha = tf.cast(alpha, self.real_dtype)
-        beta = tf.cast(beta, self.real_dtype)
-        chi = tf.cast(chi, self.real_dtype)
-        w = tf.cast(w, self.real_dtype)
+        args = [tf.cast(x, self.real_dtype) for x in (alpha, beta, chi, w)]
+        shape = tf.shape(args[0])
+        for x in args[1:]:
+            shape = tf.broadcast_dynamic_shape(shape, tf.shape(x))
+        p = tf.stack([tf.reshape(tf.broadcast_to(x, shape), [-1]) for x in args], axis=-1)
+        result = self._compiled(p)
+        return (tf.reshape(result[:, 0], shape), tf.reshape(result[:, 1], shape))
 
-        broadcast_shape = tf.broadcast_dynamic_shape(tf.shape(alpha), tf.shape(beta))
-        broadcast_shape = tf.broadcast_dynamic_shape(broadcast_shape, tf.shape(chi))
-        broadcast_shape = tf.broadcast_dynamic_shape(broadcast_shape, tf.shape(w))
-
-        alpha = tf.broadcast_to(alpha, broadcast_shape)
-        beta = tf.broadcast_to(beta, broadcast_shape)
-        chi = tf.broadcast_to(chi, broadcast_shape)
-        w = tf.broadcast_to(w, broadcast_shape)
-        output_shape = tf.shape(alpha)
-
-        alpha = tf.reshape(alpha, [-1])
-        beta = tf.reshape(beta, [-1])
-        chi = tf.reshape(chi, [-1])
-        w = tf.reshape(w, [-1])
-        result = tf.zeros(tf.shape(alpha), dtype=self.complex_dtype)
-
-        # Priority: large chi, large beta, interpolation.
-        mask_large_chi = chi > self.chi_max
-        mask_large_beta = ~mask_large_chi & (beta > self.beta_max)
-        mask_grid = ~mask_large_chi & ~mask_large_beta
-
-        def update_large_chi():
-            selected_alpha = tf.boolean_mask(alpha, mask_large_chi)
-            a = tf.square(selected_alpha)
-
-            if self.case == "even":
-                updates = tf.cast(self.transition_func(a), self.complex_dtype)
-            else:
-                updates = tf.cast(-self.slope_transition_func(a), self.complex_dtype)
-
-            return self._scatter_result(result, mask_large_chi, updates)
-
-        result = tf.cond(tf.reduce_any(mask_large_chi), update_large_chi, lambda: result)
-
-        def update_large_beta():
-            selected_alpha = tf.boolean_mask(alpha, mask_large_beta)
-            selected_chi = tf.boolean_mask(chi, mask_large_beta)
-            a = tf.square(selected_alpha)
-            c = tf.square(selected_chi)
-
-            if self.case == "even":
-                F_a = tf.cast(self.transition_func(a), self.complex_dtype)
-            elif self.case == "odd":
-                F_a = tf.cast(self.slope_transition_func(a), self.complex_dtype)
-
-            F_c = tf.cast(self.transition_func(c), self.complex_dtype)
-            updates = F_a * F_c
-            return self._scatter_result(result, mask_large_beta, updates)
-
-        result = tf.cond(tf.reduce_any(mask_large_beta), update_large_beta, lambda: result)
-
-        def update_grid():
-            selected_alpha = tf.boolean_mask(alpha, mask_grid)
-            selected_beta = tf.boolean_mask(beta, mask_grid)
-            selected_chi = tf.boolean_mask(chi, mask_grid)
-            selected_w = tf.boolean_mask(w, mask_grid)
-
-            updates = self._interpolate(selected_alpha, selected_beta, selected_chi, selected_w)
-            return self._scatter_result(result, mask_grid, updates)
-
-        result = tf.cond(tf.reduce_any(mask_grid), update_grid, lambda: result)
-        return tf.reshape(result, output_shape)
+    def evaluate(self, alpha, beta, chi, w):
+        return self(alpha, beta, chi, w)
 
 ###############################################################
 

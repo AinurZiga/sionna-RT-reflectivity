@@ -58,7 +58,8 @@ class RadioDevice(Object):
                  orientation=(0.,0.,0.),
                  look_at=None,
                  color=(0,0,0),
-                 dtype=tf.complex64):
+                 dtype=tf.complex64,
+                 display_radius=None):
 
         if dtype not in (tf.complex64, tf.complex128):
             raise ValueError("`dtype` must be tf.complex64 or tf.complex128`")
@@ -67,7 +68,7 @@ class RadioDevice(Object):
         self.position = position
         self.orientation = orientation
         self.color = color
-
+        self.display_radius = display_radius
         # Position and orientation are set through this call
         super().__init__(name, position, orientation, look_at)
 
@@ -106,6 +107,19 @@ class RadioDevice(Object):
                 self._orientation = v
         else:
             self._orientation = tf.cast(v, dtype=self._rdtype)
+
+    @property
+    def display_radius(self):
+        """Radius [m] used to display the device; None selects the automatic size."""
+        return self._display_radius
+
+    @display_radius.setter
+    def display_radius(self, radius):
+        if radius is not None:
+            radius = float(radius)
+            if radius < 0:
+                raise ValueError("`display_radius` must be a finite non-negative number or None.")
+        self._display_radius = radius
 
     def look_at(self, target):
         # pylint: disable=line-too-long

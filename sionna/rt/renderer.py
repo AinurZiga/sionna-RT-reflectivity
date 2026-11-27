@@ -275,21 +275,22 @@ def results_to_mitsuba_scene(scene, paths, show_paths, show_devices,
 
     # --- Radio devices, shown as spheres
     if show_devices:
-        # radius = max(0.0025 * sc, 1)
-        radius = max(0.0005 * sc, 1)
-        # radius = 1.0
-        for source, color in ((tx_positions, transmitter_colors),
-                              (rx_positions, receiver_colors)):
+        default_radius = max(0.005 * sc, 1)
+        for source, devices, colors in (
+            (tx_positions, scene.transmitters, transmitter_colors),
+            (rx_positions, scene.receivers, receiver_colors),
+        ):
             for index, (k, p) in enumerate(source.items()):
+                device = devices[k]
                 key = 'rd-' + k
                 assert key not in objects
                 objects[key] = {
                     'type': 'sphere',
                     'center': p,
-                    'radius': radius,
+                    'radius': default_radius if device.display_radius is None else device.display_radius,
                     'light': {
                         'type': 'area',
-                        'radiance': {'type': 'rgb', 'value': color[index]},
+                        'radiance': {'type': 'rgb', 'value': colors[index]},
                     },
                 }
 

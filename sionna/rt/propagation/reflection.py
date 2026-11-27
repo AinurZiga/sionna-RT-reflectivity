@@ -11,7 +11,7 @@ from ..paths import Paths, PathsTmpData
 from ..utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
         compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
-            cot, cross, sign, rotation_matrix, acos_diff
+            cot, cross, slab_coefficients, material_reflection_coefficients
 
 if TYPE_CHECKING:
     from ..solver_base import SolverBase
@@ -57,7 +57,7 @@ class Reflection:
         
         return mirrored_vertices, tri_p0, normals
 
-    def tracing(self, sources, targets, los, reflection, candidates, mirrored_vertices, tri_p0, normals):
+    def tracing(self, sources, targets, los, reflection, candidates, mirrored_vertices, tri_p0, normals, transmission=False):
         r"""Traces the paths from the sources to the targets.
 
         Input
@@ -84,6 +84,9 @@ class Reflection:
         normals : [max_depth, num_sources, num_samples, 3], tf.float
             Normals to the potentially hitted triangles
 
+        transmission : bool
+            Enable material-aware intersection tracing for direct candidates.
+
         Output
         ------
         spec_paths : :class:`~sionna.rt.Paths`
@@ -96,11 +99,20 @@ class Reflection:
         spec_paths = Paths(sources=sources, targets=targets, scene=self._scene,
                            types=Paths.SPECULAR)
         spec_paths_tmp = PathsTmpData(sources, targets, self._dtype)
+        spec_paths_tmp.reflection_traced = reflection
 
         if los or reflection:
             # Using the image method, computes the non-obstructed specular paths
             # interacting with the ``candidates`` primitives
-            self._spec_image_method(candidates, spec_paths, spec_paths_tmp, mirrored_vertices, tri_p0, normals)
+            # self._spec_image_method(candidates, spec_paths, spec_paths_tmp, mirrored_vertices, tri_p0, normals)
+            self._spec_image_method(
+                candidates, spec_paths, spec_paths_tmp,
+                mirrored_vertices, tri_p0, normals,
+                transmission=transmission
+            )
+
+            if transmission and los:
+                self._trace_direct_transmissions(spec_paths, spec_paths_tmp)
 
             # Compute paths length, delays, angles and directions of arrivals
             # and departures for the specular paths
@@ -112,7 +124,173 @@ class Reflection:
 
         return spec_paths, spec_paths_tmp
 
-    
+    def _trace_direct_transmissions(self, paths, paths_tmp):
+        """Trace successive surface crossings of direct paths.
+
+        Records use local [target, source, path] indices.
+        Each mesh surface represents a complete slab, not one slab interface.
+        """
+        direct = tf.reduce_all(paths.objects == -1, axis=0) & paths.mask
+        path_indices = tf.cast(tf.where(direct), tf.int32)
+
+        if tf.shape(path_indices)[0] == 0:
+            return
+        if tf.shape(self.solver._primitives_2_objects)[0] == 0:
+            return
+
+        sources = tf.gather(paths.sources, path_indices[:, 1])
+        targets = tf.gather(paths.targets, path_indices[:, 0])
+        blocked, records = self._trace_transmission_segments(sources, targets, path_indices)
+        paths.mask = tf.tensor_scatter_nd_update(paths.mask, path_indices, ~blocked)
+
+        indices, primitives, positions, orders = records
+        keep = tf.gather_nd(paths.mask, indices)
+        paths_tmp.transmission_path_indices = tf.boolean_mask(indices, keep)
+        paths_tmp.transmission_primitives = tf.boolean_mask(primitives, keep)
+        paths_tmp.transmission_t = tf.boolean_mask(positions, keep)
+        paths_tmp.transmission_order = tf.boolean_mask(orders, keep)
+        paths_tmp.transmission_segments = tf.zeros_like(paths_tmp.transmission_primitives)
+
+    def _trace_transmission_segments(self, sources, targets, path_indices, enabled=None):
+        """Return blocked rows and ordered crossings for flat ray segments."""
+        count = tf.shape(path_indices)[0]
+        num_primitives = tf.shape(self.solver._primitives_2_objects)[0]
+        empty_records = (
+            path_indices[:0], tf.zeros([0], tf.int32),
+            tf.zeros([0], self._rdtype), tf.zeros([0], tf.int32),
+        )
+        if count == 0 or num_primitives == 0:
+            return tf.zeros([count], tf.bool), empty_records
+
+        directions, distances = normalize(targets - sources)
+
+        if enabled is None:
+            array_size = tf.reduce_max(self.solver._primitives_2_objects) + 1
+            _, enabled = self.solver._build_slab_properties_tensors(array_size)
+
+        count = tf.shape(path_indices)[0]
+        blocked = tf.zeros([count], tf.bool)
+        offsets = tf.fill([count], tf.cast(self.solver.EPSILON_OBSTRUCTION, self._rdtype))
+        epsilon = tf.cast(self.solver.EPSILON_OBSTRUCTION, self._rdtype)
+
+        record_paths = []
+        record_primitives = []
+        record_t = []
+        record_order = []
+
+        order = 0
+        max_crossings = int(tf.shape(self.solver._primitives_2_objects)[0]) + 1
+
+        while True:
+            active = ~blocked & (offsets < distances - epsilon)
+            rows = tf.cast(tf.where(active)[:, 0], tf.int32)
+            if tf.size(rows) == 0:
+                break
+            if order >= max_crossings:
+                raise RuntimeError("Transmission tracing failed to advance along a segment.")
+
+            ray_directions = tf.gather(directions, rows)
+            ray_offsets = tf.gather(offsets, rows)
+            ray_origins = tf.gather(sources, rows) + ray_offsets[:, None] * ray_directions
+            ray_lengths = tf.gather(distances, rows) - ray_offsets - epsilon
+
+            ray = mi.Ray3f(
+                o=self.solver._mi_point_t(ray_origins),
+                d=self.solver._mi_vec_t(ray_directions),
+                maxt=self.solver._mi_scalar_t(ray_lengths),
+                time=0.0, wavelengths=mi.Color0f(0.0),
+            )
+            si = self.solver._mi_scene.ray_intersect(ray)
+            hit = si.is_valid()
+
+            shape_idx = dr.gather(
+                mi.Int32, self.solver._shape_indices,
+                dr.reinterpret_array_v(mi.UInt32, si.shape), hit
+            )
+            primitive_offset = dr.gather(
+                mi.Int32, self.solver._prim_offsets, shape_idx, hit
+            )
+            primitive = dr.select(hit, primitive_offset + mi.Int32(si.prim_index), -1)
+
+            hit_mask = mi_to_tf_tensor(hit, tf.bool)
+            hit_rows = tf.boolean_mask(rows, hit_mask)
+            hit_primitives = tf.boolean_mask(mi_to_tf_tensor(primitive, tf.int32), hit_mask)
+            hit_distance = tf.boolean_mask(mi_to_tf_tensor(si.t, self._rdtype), hit_mask)
+
+            # Rays without further intersections have reached their targets.
+            missed_rows = tf.boolean_mask(rows, ~hit_mask)
+            offsets = tf.tensor_scatter_nd_update(
+                offsets, missed_rows[:, None], tf.gather(distances, missed_rows)
+            )
+
+            if tf.size(hit_rows) == 0:
+                break
+
+            absolute_distance = tf.gather(offsets, hit_rows) + hit_distance
+            hit_objects = tf.gather(self.solver._primitives_2_objects, hit_primitives)
+            allowed = tf.gather(enabled, hit_objects)
+
+            blocked = tf.tensor_scatter_nd_update(blocked, hit_rows[:, None], ~allowed)
+
+            record_paths.append(tf.gather(path_indices, tf.boolean_mask(hit_rows, allowed)))
+            record_primitives.append(tf.boolean_mask(hit_primitives, allowed))
+            record_t.append(tf.boolean_mask(
+                absolute_distance / tf.gather(distances, hit_rows), allowed
+            ))
+            record_order.append(tf.fill([tf.reduce_sum(tf.cast(allowed, tf.int32))], order))
+
+            # Advance beyond the hit surface to avoid hitting it again.
+            offsets = tf.tensor_scatter_nd_update(
+                offsets, hit_rows[:, None], absolute_distance + epsilon
+            )
+            order += 1
+
+        if not record_paths:
+            return blocked, empty_records
+
+        return blocked, (
+            tf.concat(record_paths, axis=0), tf.concat(record_primitives, axis=0),
+            tf.concat(record_t, axis=0), tf.concat(record_order, axis=0),
+        )
+
+    def _trace_diffraction_transmissions(self, objects, points, sources, targets, paths_tmp):
+        """Check both segments and store crossings in compacted path order."""
+        indices = tf.cast(tf.where(objects >= 0), tf.int32)
+        if tf.shape(indices)[0] == 0:
+            return objects
+
+        tx = tf.gather(sources, indices[:, 1])
+        rx = tf.gather(targets, indices[:, 0])
+        interaction = tf.gather_nd(points, indices)
+
+        array_size = tf.reduce_max(self.solver._primitives_2_objects) + 1
+        _, enabled = self.solver._build_slab_properties_tensors(array_size)
+        blocked_in, incoming = self._trace_transmission_segments(tx, interaction, indices, enabled)
+        blocked_out, outgoing = self._trace_transmission_segments(interaction, rx, indices, enabled)
+
+        blocked_indices = tf.boolean_mask(indices, blocked_in | blocked_out)
+        objects = tf.tensor_scatter_nd_update(
+            objects, blocked_indices, tf.fill([tf.shape(blocked_indices)[0]], -1)
+        )
+
+        # Match the compaction performed by the WD and VD path builders.
+        valid = objects >= 0
+        compact_slots = tf.cumsum(tf.cast(valid, tf.int32), axis=-1) - 1
+        hit_indices = tf.concat([incoming[0], outgoing[0]], axis=0)
+        primitives = tf.concat([incoming[1], outgoing[1]], axis=0)
+        positions = tf.concat([incoming[2], outgoing[2]], axis=0)
+        orders = tf.concat([incoming[3], outgoing[3]], axis=0)
+        segments = tf.concat([tf.zeros_like(incoming[1]), tf.ones_like(outgoing[1])], axis=0)
+
+        keep = tf.gather_nd(valid, hit_indices)
+        hit_indices = tf.boolean_mask(hit_indices, keep)
+        new_slots = tf.gather_nd(compact_slots, hit_indices)
+        paths_tmp.transmission_path_indices = tf.concat([hit_indices[:, :2], new_slots[:, None]], axis=1)
+        paths_tmp.transmission_primitives = tf.boolean_mask(primitives, keep)
+        paths_tmp.transmission_t = tf.boolean_mask(positions, keep)
+        paths_tmp.transmission_order = tf.boolean_mask(orders, keep)
+        paths_tmp.transmission_segments = tf.boolean_mask(segments, keep)
+        return objects
 
     def _spec_image_method_phase_1(self, candidates, sources):
         r"""
@@ -421,7 +599,7 @@ class Reflection:
         # We use the Moeller Trumbore algorithm
         # t : [num_targets, num_sources, num_samples]
         # hit : [num_targets, num_sources, num_samples]
-        t, hit = moller_trumbore(current, d, p0, p1, p2, self.solver.EPSILON)
+        t, hit = moller_trumbore(current, d, p0, p1, p2, self.solver.EPSILON, barycentric_epsilon=0.0)
         # [num_targets, num_sources, num_samples]
         valid = tf.logical_and(valid, tf.logical_or(~active, hit))
 
@@ -819,11 +997,12 @@ class Reflection:
             valid_normals = valid_normals[:max_depth]
             # [max_depth, num_targets, num_sources, max_num_paths]
             valid_objects = valid_objects[:max_depth]
+            valid_primitives = valid_primitives[:max_depth]
 
-        return mask, valid_vertices, valid_objects, valid_normals
+        return mask, valid_vertices, valid_objects, valid_normals, valid_primitives
     
 
-    def _spec_image_method(self, candidates, paths, spec_paths_tmp, mirrored_vertices, tri_p0, normals):
+    def _spec_image_method(self, candidates, paths, spec_paths_tmp, mirrored_vertices, tri_p0, normals, transmission=False):
         # pylint: disable=line-too-long
         r"""
         Evaluates a list of candidate paths ``candidates`` and keep only the
@@ -840,6 +1019,9 @@ class Reflection:
 
         paths : :class:`~sionna.rt.Paths`
             Paths to update
+
+        transmission : bool
+            Enable material-aware intersection tracing for direct candidates.
         """
 
         sources = paths.sources
@@ -984,6 +1166,13 @@ class Reflection:
                                      tf.reshape(maxt, [-1]))
         # [num_targets, num_sources, num_samples, 3]
         blk = tf.reshape(val, tf.shape(maxt))
+
+        # Direct candidates get a separate material-aware visibility check.
+        # Reflection candidates retain their existing obstruction test.
+        if transmission:
+            direct_candidate = tf.reduce_all(candidates == -1, axis=0)
+            blk = tf.where(direct_candidate[None, None, :], tf.zeros_like(blk), blk)
+
         # Discard paths for which the shooted ray has zero-length, i.e., when
         # two consecutive intersection points have the same location, or when
         # the source and target have the same locations (RADAR).
@@ -1009,7 +1198,7 @@ class Reflection:
         # valid_normals : [max_depth, num_targets, num_sources,
         #                   max_num_paths, 3], tf.float
         #     Normals to the primitives at the intersection points.
-        mask, valid_vertices, valid_objects, valid_normals =\
+        mask, valid_vertices, valid_objects, valid_normals, valid_primitives =\
             self._spec_image_method_phase_3(candidates, valid, num_targets,
                                 num_sources, path_vertices, path_normals, blk)
 
@@ -1022,6 +1211,7 @@ class Reflection:
         #paths.depth_mask = valid_objects != -1
 
         spec_paths_tmp.normals = valid_normals
+        spec_paths_tmp.reflection_primitives = valid_primitives
 
     ### For combinations (reflection+diffraction)
 
@@ -1162,7 +1352,7 @@ class Reflection:
         # We use the Moeller Trumbore algorithm
         # t : [num_targets, num_sources, num_samples]
         # hit : [num_targets, num_sources, num_samples]
-        t, hit = moller_trumbore(current, d, p0, p1, p2, self.solver.EPSILON)
+        t, hit = moller_trumbore(current, d, p0, p1, p2, self.solver.EPSILON, barycentric_epsilon=0.0)
         # [num_targets, num_sources, num_samples]
         valid = tf.logical_and(valid, tf.logical_or(~active, hit))
 
@@ -1571,8 +1761,9 @@ class Reflection:
         return mat_t
     
     def _spec_transition_matrices(self, relative_permittivity,
-                                  scattering_coefficient,
-                                  paths, paths_tmp, scattering):
+                             scattering_coefficient,
+                             paths, paths_tmp, scattering,
+                             thickness, transmission_enabled):
         # pylint: disable=line-too-long
         """
         Compute the transfer matrices, delays, angles of departures, and angles
@@ -1595,6 +1786,12 @@ class Reflection:
 
         scattering : bool
             Set to `True` if computing the scattered paths.
+
+        thickness : [num_shape], tf.float
+            Slab thickness indexed by object ID [m].
+
+        transmission_enabled : [num_shape], tf.bool
+            Whether to use the finite-slab reflection model.
 
         Output
         -------
@@ -1678,6 +1875,14 @@ class Reflection:
         # Compute r_s, r_p at each reflection point
         # [max_depth, num_targets, num_sources, max_num_paths]
         r_s, r_p = reflection_coefficient(etas, cos_theta)
+
+        safe_object_idx = tf.where(objects >= 0, objects, tf.zeros_like(objects))
+        slab_thickness = tf.gather(thickness, safe_object_idx)
+        slab_enabled = (objects >= 0) & tf.gather(transmission_enabled, safe_object_idx)
+
+        r_s, r_p = material_reflection_coefficients(
+            etas, cos_theta, slab_thickness, slab_enabled, self._scene.wavelength
+        )
 
         # Multiply the reflection coefficients with the
         # reflection reduction factor
@@ -1816,4 +2021,113 @@ class Reflection:
         # [num_targets, num_sources, max_num_paths, 2, 2]
         mat_t = tf.where(mask_, mat_t, tf.zeros_like(mat_t))
 
+        return mat_t
+
+
+    def _segment_transmission_operator(
+        self, paths, paths_tmp, relative_permittivity, thickness,
+        segment=0, diffraction=False,
+    ):
+        """Compose crossings in the endpoint polarization basis of a segment."""
+        indices = paths_tmp.transmission_path_indices
+        keep = tf.gather_nd(paths.mask, indices) & (paths_tmp.transmission_segments == segment)
+        indices = tf.boolean_mask(indices, keep)
+
+        if tf.shape(indices)[0] == 0:
+            return None
+
+        primitives = tf.boolean_mask(paths_tmp.transmission_primitives, keep)
+        positions = tf.boolean_mask(paths_tmp.transmission_t, keep)
+        orders = tf.boolean_mask(paths_tmp.transmission_order, keep)
+        object_idxs = tf.gather(self.solver._primitives_2_objects, primitives)
+
+        sources = tf.gather(paths.sources, indices[:, 1])
+        targets = tf.gather(paths.targets, indices[:, 0])
+        if diffraction:
+            interaction = tf.gather_nd(paths.vertices[0], indices)
+            if segment == 0:
+                targets = interaction
+            else:
+                sources = interaction
+        k_hat, _ = normalize(targets - sources)
+        normals = tf.gather(self.solver._normals, primitives)
+        cos_theta = tf.abs(dot(k_hat, normals, clip=True))
+
+        rm_callable = self._scene.radio_material_callable
+        if rm_callable is None:
+            etas = tf.gather(relative_permittivity, object_idxs)
+        else:
+            points = sources + positions[:, None] * (targets - sources)
+            etas, _, _ = rm_callable(object_idxs, points)
+
+        _, _, t_s, t_p = slab_coefficients(
+            eta=etas,
+            cos_theta_i=cos_theta,
+            thickness=tf.gather(thickness, object_idxs),
+            wavelength=self._scene.wavelength,
+            dtype=self._dtype,
+        )
+
+        # Match the departure or arrival basis of the diffraction matrix.
+        if diffraction and segment == 1:
+            theta = tf.gather_nd(paths.theta_r, indices)
+            phi = tf.gather_nd(paths.phi_r, indices)
+        else:
+            theta = tf.gather_nd(paths.theta_t, indices)
+            phi = tf.gather_nd(paths.phi_t, indices)
+
+        basis_s = theta_hat(theta, phi)
+        basis_p = phi_hat(phi)
+
+        glass_s, glass_s_norm = normalize(cross(k_hat, normals))
+        glass_s = tf.where((glass_s_norm < 1e-7)[:, None], basis_s, glass_s)
+        glass_p, _ = normalize(cross(glass_s, k_hat))
+
+        mat_in = tf.cast(
+            component_transform(basis_s, basis_p, glass_s, glass_p), self._dtype
+        )
+        mat_out = tf.cast(
+            component_transform(glass_s, glass_p, basis_s, basis_p), self._dtype
+        )
+        crossing_matrices = tf.matmul(
+            mat_out, tf.stack([t_s, t_p], axis=-1)[..., None] * mat_in
+        )
+
+        transfer = tf.eye(2, batch_shape=tf.shape(paths.mask), dtype=self._dtype)
+
+        # Left multiplication follows physical source-to-target order.
+        for order in tf.range(tf.reduce_max(orders) + 1):
+            selected = orders == order
+            selected_indices = tf.boolean_mask(indices, selected)
+            crossing = tf.boolean_mask(crossing_matrices, selected)
+            current = tf.gather_nd(transfer, selected_indices)
+            transfer = tf.tensor_scatter_nd_update(
+                transfer, selected_indices, tf.matmul(crossing, current)
+            )
+
+        return transfer
+
+    def _apply_direct_transmission(self, paths, paths_tmp, mat_t,
+                                   relative_permittivity, thickness):
+        transfer = self._segment_transmission_operator(
+            paths, paths_tmp, relative_permittivity, thickness
+        )
+        return mat_t if transfer is None else tf.matmul(mat_t, transfer)
+
+    def _apply_diffraction_transmission(self, paths, paths_tmp, mat_t,
+                                        relative_permittivity, thickness, path_indices=None):
+        incoming = self._segment_transmission_operator(
+            paths, paths_tmp, relative_permittivity, thickness, segment=0, diffraction=True
+        )
+        outgoing = self._segment_transmission_operator(
+            paths, paths_tmp, relative_permittivity, thickness, segment=1, diffraction=True
+        )
+        if incoming is not None:
+            if path_indices is not None:
+                incoming = tf.gather_nd(incoming, path_indices)
+            mat_t = tf.matmul(mat_t, incoming)
+        if outgoing is not None:
+            if path_indices is not None:
+                outgoing = tf.gather_nd(outgoing, path_indices)
+            mat_t = tf.matmul(outgoing, mat_t)
         return mat_t

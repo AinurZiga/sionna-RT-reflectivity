@@ -879,6 +879,37 @@ class Paths:
     def true_objects(self, v):
         self._true_objects = v
 
+    @property
+    def wedge_ids(self):
+        """Debug wedge IDs [num_targets, num_sources, num_paths], or None.
+
+        Entries align with objects[0], without a batch axis. Invalid slots
+        and other mechanisms are marked -1.
+        """
+        return getattr(self, "_wedge_ids", None)
+
+    @wedge_ids.setter
+    def wedge_ids(self, value):
+        self._wedge_ids = value
+
+    @property
+    def wedge_pairs(self):
+        """Debug wedge pairs [target, source, path, 2] in TX-to-RX order."""
+        return getattr(self, "_wedge_pairs", None)
+
+    @wedge_pairs.setter
+    def wedge_pairs(self, value):
+        self._wedge_pairs = value
+
+    @property
+    def dd_types(self):
+        """Debug labels [target, source, path]: EE=0, EV=1, VE=2, VV=3, SV=4."""
+        return getattr(self, "_dd_types", None)
+
+    @dd_types.setter
+    def dd_types(self, value):
+        self._dd_types = value
+
     def merge(self, more_paths):
         r"""
         Merge ``more_paths`` with the current paths and returns the so-obtained
@@ -897,6 +928,25 @@ class Paths:
         more_true_objects = more_paths.true_objects
         more_types = more_paths.types
         more_my_types = more_paths.my_types
+
+        if self.wedge_ids is not None or more_paths.wedge_ids is not None:
+            left = self.wedge_ids
+            right = more_paths.wedge_ids
+            if left is None:
+                left = tf.fill(tf.shape(self.mask), -1)
+            if right is None:
+                right = tf.fill(tf.shape(more_paths.mask), -1)
+            self.wedge_ids = tf.concat([left, right], axis=2)
+
+        for name, tail in (("wedge_pairs", [2]), ("dd_types", [])):
+            left, right = getattr(self, name), getattr(more_paths, name)
+            if left is None and right is None:
+                continue
+            if left is None:
+                left = tf.fill(tf.concat([tf.shape(self.mask), tf.constant(tail, tf.int32)], axis=0), -1)
+            if right is None:
+                right = tf.fill(tf.concat([tf.shape(more_paths.mask), tf.constant(tail, tf.int32)], axis=0), -1)
+            setattr(self, name, tf.concat([left, right], axis=2))
 
         # The paths to merge must have the same number of sources and targets
         assert more_paths.targets.shape[0] == self.targets.shape[0],\
@@ -1127,6 +1177,12 @@ class Paths:
         new_paths.objects = tf.gather(self.objects, indices, axis=axis)
         new_paths.true_objects = tf.gather(self.true_objects, indices, axis=axis)
         new_paths.my_types = tf.gather(self.my_types, indices, axis=axis)
+        if self.wedge_ids is not None:
+            new_paths.wedge_ids = tf.gather(self.wedge_ids, indices, axis=axis - 1)
+        for name in ("wedge_pairs", "dd_types"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(new_paths, name, tf.gather(value, indices, axis=axis - 1))
 
         if not is_finalized:
             new_paths.types = self.types
@@ -1152,6 +1208,10 @@ class Paths:
             new_paths.phi_r = tf.gather(self.phi_r, indices, axis=axis-1)
             new_paths.tau = tf.gather(self.tau, indices, axis=axis-1)
 
+        vertex_wedge_mask = getattr(self, "vertex_wedge_mask", None)
+        if vertex_wedge_mask is not None:
+            new_paths.vertex_wedge_mask = tf.gather(vertex_wedge_mask, indices, axis=axis - 1)
+
         return new_paths
 
 
@@ -1165,6 +1225,15 @@ class PathsTmpData:
         self.sources = sources
         self.targets = targets
         self.dtype = dtype
+
+        # Flat transmission records, indexed before merging path families.
+        # Each path index is [target, source, path].
+        self.transmission_path_indices = tf.zeros([0, 3], tf.int32)
+        self.transmission_segments = tf.zeros([0], tf.int32)
+        self.transmission_primitives = tf.zeros([0], tf.int32)
+        self.transmission_t = tf.zeros([0], dtype.real_dtype)
+        self.transmission_order = tf.zeros([0], tf.int32)
+
         num_sources = tf.shape(sources)[0]
         num_targets = tf.shape(targets)[0]
 
@@ -1358,6 +1427,10 @@ def invert_s_t(paths: Paths, paths_tmp: PathsTmpData):
     new_paths.true_objects = tf.transpose(paths.true_objects[::-1], perm=[0, 2, 1, 3])
     new_paths.my_types = tf.transpose(paths.my_types[::-1], perm=[0, 2, 1, 3])
 
+    vertex_wedge_mask = getattr(paths, "vertex_wedge_mask", None)
+    if vertex_wedge_mask is not None:
+        new_paths.vertex_wedge_mask = tf.transpose(vertex_wedge_mask, perm=[1, 0, 2, 3])
+
     new_paths.theta_t = tf.transpose(paths.theta_r, perm=[1, 0, 2])
     new_paths.phi_t = tf.transpose(paths.phi_r, perm=[1, 0, 2])
     new_paths.theta_r = tf.transpose(paths.theta_t, perm=[1, 0, 2])
@@ -1366,10 +1439,16 @@ def invert_s_t(paths: Paths, paths_tmp: PathsTmpData):
     new_paths.tau = tf.transpose(paths.tau, perm=[1, 0, 2])
     new_paths.types = paths.types
 
-    try:
-        new_paths_tmp.normals = tf.transpose(paths_tmp.normals, perm=[1, 0, 2, 3])
-    except:
-        pass
+    normals = paths_tmp.normals
+
+    if normals.shape.rank == 5:
+        # [depth, targets, sources, paths, xyz]: reverse interactions and swap devices.
+        new_paths_tmp.normals = tf.transpose(normals[::-1], [0, 2, 1, 3, 4])
+    elif normals.shape.rank == 4:
+        # Legacy layout without an interaction axis.
+        new_paths_tmp.normals = tf.transpose(normals, [1, 0, 2, 3])
+    else:
+        raise ValueError(f"Unexpected paths_tmp.normals shape: {normals.shape}")
     
     new_paths_tmp.k_i = tf.transpose(paths_tmp.k_i[::-1], perm=[0, 2, 1, 3, 4])
     new_paths_tmp.k_r = tf.transpose(paths_tmp.k_r[::-1], perm=[0, 2, 1, 3, 4])

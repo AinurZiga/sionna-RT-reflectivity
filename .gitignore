@@ -22,5 +22,8 @@ dist/
 
 **.png
 **.jpg
+**.mp4
 **.mat
 **.h5
+**.npz
+**.pkl

@@ -143,16 +143,30 @@ class InteractiveDisplay:
                            receiver in scene.receivers.values()]
 
         # Radio emitters, shown as points
-        p = np.array(list(tx_positions.values()) + list(rx_positions.values()))
-        albedo = np.array(transmitter_colors + receiver_colors)
+        # p = np.array(list(tx_positions.values()) + list(rx_positions.values()))
+        # albedo = np.array(transmitter_colors + receiver_colors)
 
-        if p.shape[0] > 0:
-            # Radio devices are not persistent
-            #radius = 0.1 * max(0.005 * sc, 1)
-            # radius = max(0.005 * sc, 0.1)   # TODO
-            radius = 0.1 * max(0.005 * sc, 0.1)   # TODO
-            self._plot_points(p, persist=False, colors=albedo,
-                              radius=radius)
+        # if p.shape[0] > 0:
+        #     # Radio devices are not persistent
+        #     #radius = 0.1 * max(0.005 * sc, 1)
+        #     # radius = max(0.005 * sc, 0.1)   # TODO
+        #     radius = 0.1 * max(0.005 * sc, 0.1)   # TODO
+        #     self._plot_points(p, persist=False, colors=albedo,
+        #                       radius=radius)
+
+        default_radius = 0.2 # max(0.005 * sc, 1)
+        groups = {}
+
+        for devices, positions in ((scene.transmitters, tx_positions), (scene.receivers, rx_positions)):
+            for name, device in devices.items():
+                radius = default_radius if device.display_radius is None else device.display_radius
+                points, colors = groups.setdefault(radius, ([], []))
+                points.append(positions[name])
+                colors.append(device.color.numpy())
+
+            for radius, (points, colors) in groups.items():
+                self._plot_points(np.asarray(points), persist=False, colors=np.asarray(colors), radius=radius)
+
         if show_orientations:
             line_length = 0.0075 * sc
             head_length = 0.15 * line_length

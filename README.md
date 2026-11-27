@@ -37,11 +37,17 @@ Python dependencies are specified in `setup.cfg`. CPU execution requires LLVM; G
 
 ## Examples
 
-Examples are provided in [`examples/scattering`](examples/scattering):
+- [Cylinder](examples/scattering/cylinder.ipynb): scattering and shadow fields for a faceted cylinder, compared with a 2D analytical solution.
+- [Sphere](examples/scattering/sphere_7lambda.ipynb): scattering and shadow fields for a faceted sphere, compared with the analytical PEC sphere solution.
+- [Street canyon](examples/outdoor/simple_street_canyon.ipynb): moving vehicles in a built-in outdoor scene, with delay–Doppler plots.
 
-- [`cylinders.ipynb`](examples/scattering/cylinders.ipynb): scattering and shadow fields for a faceted cylinder, illustrating the effect of double edge diffraction.
-- [`spheres.ipynb`](examples/scattering/spheres.ipynb): scattering from a discretized sphere, where vertex diffraction is particularly important, with full-wave comparisons.
-- [`low_poly_car.ipynb`](examples/scattering/low_poly_car.ipynb): full-wave comparisons for a simplified vehicle in both the backscattering and shadow/blockage regions.
+## Edge–vertex diffraction table
+
+To run the full second-order comparison in the sphere notebook, generate the EV table once from the repository root:
+
+```bash
+python tools/generate_ev_table.py
+```
 
 ## References
 

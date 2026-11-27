@@ -95,17 +95,29 @@ class RadioMaterial:
     dtype : tf.complex64 or tf.complex128
         Datatype.
         Defaults to `tf.complex64`.
+
+    thickness : float | tf.Tensor | tf.Variable
+        Thickness of the thin slab represented by the surface [m].
+        Must be a finite, non-negative scalar.
+        Defaults to 0.
+
+    transmission_enabled : bool
+        Whether transmission through surfaces using this material is allowed.
+        Defaults to False.
     """
 
     def __init__(self,
-                 name,
-                 relative_permittivity=1.0,
-                 conductivity=0.0,
-                 scattering_coefficient=0.0,
-                 xpd_coefficient=0.0,
-                 scattering_pattern=None,
-                 frequency_update_callback=None,
-                 dtype=tf.complex64):
+                name,
+                relative_permittivity=1.0,
+                conductivity=0.0,
+                scattering_coefficient=0.0,
+                xpd_coefficient=0.0,
+                scattering_pattern=None,
+                frequency_update_callback=None,
+                dtype=tf.complex64,
+                *,
+                thickness=0.0,
+                transmission_enabled=False):
 
         if not isinstance(name, str):
             raise TypeError("`name` must be a string")
@@ -116,6 +128,9 @@ class RadioMaterial:
             raise ValueError(msg)
         self._dtype = dtype
         self._rdtype = dtype.real_dtype
+
+        self.thickness = thickness
+        self.transmission_enabled = transmission_enabled
 
         if scattering_pattern is None:
             scattering_pattern = LambertianPattern(dtype=dtype)
@@ -200,6 +215,35 @@ class RadioMaterial:
             self._conductivity = tf.cast(v, self._rdtype)
 
     @property
+    def thickness(self):
+        """tf.float: Get/set the non-negative slab thickness [m]."""
+        return self._thickness
+
+    @thickness.setter
+    def thickness(self, value):
+        if isinstance(value, tf.Variable):
+            if value.dtype != self._rdtype:
+                raise TypeError(f"`thickness` must have dtype={self._rdtype}")
+        else:
+            value = tf.cast(value, self._rdtype)
+
+        tf.debugging.assert_rank(value, 0, message="`thickness` must be scalar.")
+        tf.debugging.assert_all_finite(value, "`thickness` must be finite.")
+        tf.debugging.assert_non_negative(value, message="`thickness` must be non-negative.")
+        self._thickness = value
+
+    @property
+    def transmission_enabled(self):
+        """bool: Get/set whether transmission through this material is allowed."""
+        return self._transmission_enabled
+
+    @transmission_enabled.setter
+    def transmission_enabled(self, value):
+        if not isinstance(value, bool):
+            raise TypeError("`transmission_enabled` must be a bool.")
+        self._transmission_enabled = value
+
+    @property
     def scattering_coefficient(self):
         r"""
         tf.float: Get/set the scattering coefficient
@@ -278,13 +322,15 @@ class RadioMaterial:
 
     @property
     def well_defined(self):
-        """bool : Get if the material is well-defined"""
-        # pylint: disable=chained-comparison
+        """bool: Get if the material is well-defined."""
+        # Check thickness again because an attached variable can change.
         return ((self._conductivity >= 0.)
              and (self.relative_permittivity >= 1.)
              and (0. <= self.scattering_coefficient <= 1.)
              and (0. <= self.xpd_coefficient <= 1.)
-             and (0. <= self.scattering_pattern.lambda_ <= 1.))
+             and (0. <= self.scattering_pattern.lambda_ <= 1.)
+             and tf.math.is_finite(self.thickness)
+             and (self.thickness >= 0.))
 
     @property
     def use_counter(self):
@@ -368,3 +414,5 @@ class RadioMaterial:
         self.xpd_coefficient = rm.xpd_coefficient
         self.scattering_pattern = rm.scattering_pattern
         self.frequency_update_callback = rm.frequency_update_callback
+        self.thickness = rm.thickness
+        self.transmission_enabled = rm.transmission_enabled

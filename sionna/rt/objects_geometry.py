@@ -17,7 +17,7 @@ from .utils import dot, phi_hat, theta_hat, theta_phi_from_unit_vec,\
     normalize, moller_trumbore, component_transform, mi_to_tf_tensor,\
         compute_field_unit_vectors, reflection_coefficient, fibonacci_lattice,\
             cot, cross, sign, rotation_matrix, acos_diff, rot_mat_from_unit_vecs, \
-            r_hat
+            r_hat, slab_coefficients
 
 if TYPE_CHECKING:
     from .solver_paths import SolverPaths
@@ -27,31 +27,36 @@ K_MAX = 100
 
 
 class ObjectsGeometry:
-    def __init__(self, solver_paths: SolverPaths, is_table_gfi=True):
+    def __init__(self, solver_paths: SolverPaths, is_table_gfi=True, gfi_filename=None):
         self.solver_paths = solver_paths
-        self._dtype = self.solver_paths._dtype   # complex
-        self._rdtype = self.solver_paths._rdtype  # float
+        self._dtype = self.solver_paths._dtype
+        self._rdtype = self.solver_paths._rdtype
         self.is_table_gfi = is_table_gfi
 
-        if self.is_table_gfi:
-            self.diffraction_tables = DiffractionTables(dtype=self._dtype)
-        else:
-            self.diffraction_tables = None
+        # Keep the container even when GFI lookup is disabled: EV uses its file paths.
+        self.diffraction_tables = DiffractionTables(
+            dtype=self._dtype, use_gfi_lookup=is_table_gfi, gfi_filename=gfi_filename
+        )
 
         self.is_vertex_diffraction = True
         self.is_double_diffraction = False
         self.is_triple_diffraction = False
         self.add_obj_primitives = True
+        self.enable_env_object_rr = False  # Supplement two-bounce specular candidates.
+        self.enable_env_object_rwd = False  # Environment reflection and object wedge diffraction.
+        self.enable_env_object_rvd = False  # Environment reflection and object vertex diffraction.
         self.is_sbr_rxs = True
 
         self.is_glass_transmission = False
-        self.los_transmissions = 'one'  # 'one, 'two'
+        self.los_transmissions = "one"
 
         self._vertex_indices = tf.zeros([0], dtype=tf.int32)
         self._update_geometry()
 
         shapes = self.solver_paths._mi_scene.shapes()
-        self._objects_2_primitives = np.cumsum([0] + [shape.effective_primitive_count() for shape in shapes])
+        self._objects_2_primitives = np.cumsum(
+            [0] + [shape.effective_primitive_count() for shape in shapes]
+        )
 
     def _update_geometry(self):
         """Refresh geometry from the solver without rebuilding connectivity."""
@@ -92,7 +97,6 @@ class ObjectsGeometry:
                         'wedge_2_facets',
                         'wedge_2_vertices',
                         'vertex_2_wedges',
-                        'wedge_2_adj_wedges',
                         'dd_wedges',
                         'dd_wedge_vertex',
                         'vertices_2_objects',
@@ -123,6 +127,9 @@ class ObjectsGeometry:
         data_dict : `dict`
         """
         for attr_name in data_dict:
+            # Ignore the removed connectivity table in older serialized dictionaries.
+            if attr_name in ("wedge_2_adj_wedges", "_wedge_2_adj_wedges"):
+                continue
             attr_obj = data_dict[attr_name]
             setattr(self, '_' + attr_name, attr_obj)
 
@@ -140,7 +147,6 @@ class ObjectsGeometry:
         wedge_2_facets = tf.ones([0, 2], dtype=tf.int32)
         wedge_2_vertices = tf.ones([0, 2], dtype=tf.int32)
         vertex_2_wedges = []
-        wedge_2_adj_wedges = []
         dd_wedges = tf.ones([0, 2], dtype=tf.int32)
         dd_wedge_vertex = tf.ones([0, 2], dtype=tf.int32)
         vertices_2_objects = []
@@ -173,27 +179,27 @@ class ObjectsGeometry:
             if in_object_filenames is not None and in_object_filenames[i] is not None:
                 obj_filename = in_object_filenames[i]
                 with open(obj_filename, "rb") as f:
-                    _vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, _wedge_2_adj_wedges, \
+                    _vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, _unused_wedge_adjacency, \
                         _dd_wedges, _dd_wedge_vertex = pickle.load(f)
+                del _unused_wedge_adjacency
 
             # 2) compute structures
             else:
-                _vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, _wedge_2_adj_wedges = \
+                _vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets = \
                                     get_data_types(_vertices, facets, facet_2_wedges)  # + facet_2_wedges
 
-            if self.is_double_diffraction:
-                if in_object_filenames is None or in_object_filenames[i] is None:
-                    _dd_wedges = self._get_dd_wedges(facet_2_wedges, _facet_2_adj_facets, _wedge_2_facets)
-                    _dd_wedge_vertex = self._get_dd_edge_vertex(facet_2_wedges, facets, _wedge_2_vertices)
+            # if self.is_double_diffraction:
+            #     if in_object_filenames is None or in_object_filenames[i] is None:
+            #         _dd_wedges = self._get_dd_wedges(facet_2_wedges, _facet_2_adj_facets, _wedge_2_facets)
+            #         _dd_wedge_vertex = self._get_dd_edge_vertex(facet_2_wedges, facets, _wedge_2_vertices)
 
-                dd_wedges = tf.concat([dd_wedges, _dd_wedges], axis=0)
-                dd_wedge_vertex = tf.concat([dd_wedge_vertex, _dd_wedge_vertex], axis=0)
+            #     dd_wedges = tf.concat([dd_wedges, _dd_wedges], axis=0)
+            #     dd_wedge_vertex = tf.concat([dd_wedge_vertex, _dd_wedge_vertex], axis=0)
 
             if not len(_vertices) == num_vertices == len(_vertex_2_wedges):
                 print("Wrong number of vertices in a mesh:", object_names[np.where(np.array(ids) == obj_id)[0][0]])
 
             vertex_2_wedges += _vertex_2_wedges
-            wedge_2_adj_wedges += _wedge_2_adj_wedges
             wedge_2_facets = tf.concat([wedge_2_facets, _wedge_2_facets], axis=0)
             wedge_2_vertices = tf.concat([wedge_2_vertices, _wedge_2_vertices], axis=0)
 
@@ -206,8 +212,8 @@ class ObjectsGeometry:
 
         # [num_vertices, num_wedges_per_vertex]
         self.vertex_2_wedges = tf.ragged.constant(vertex_2_wedges, dtype=tf.int32)
-        # [num_wedges, num_adj_wedges]
-        self.wedge_2_adj_wedges = tf.ragged.constant(wedge_2_adj_wedges, dtype=tf.int32)
+        self._remove_duplicate_vertex_wedges(tolerance=1e-6)
+
         # [num_wedges, 2]
         self.wedge_2_facets = wedge_2_facets
         # [num_facets, 3, 2]
@@ -244,6 +250,67 @@ class ObjectsGeometry:
         self.active_primitives_dd = tf.fill([self._primitive_idxs.shape[0]], True)
 
         print('num vertices:', self._vertices.shape[0])
+
+    def _remove_duplicate_vertex_wedges(self, tolerance=1e-6):
+        r"""
+        Remove repeated wedge contributions at coincident vertices.
+
+        Vertex rows and their indices are preserved. Within each group of
+        quantized vertex positions, each wedge ID is retained only once,
+        at its first occurrence. Empty rows are allowed.
+
+        Parameters
+        ----------
+        tolerance : float
+            Positive coordinate quantization step in scene units.
+            Use the same value as in SolverBase._extract_wedges().
+
+        Notes
+        -----
+        This initialization-only operation uses NumPy and does not modify mesh
+        coordinates or the geometry update graph. Quantization groups equal
+        keys; it is not a distance-based merge.
+        """
+
+        if tolerance <= 0:
+            raise ValueError("tolerance must be positive.")
+
+        vertices = self._vertices.numpy()
+        rows = self.vertex_2_wedges.to_list()
+
+        if len(vertices) != len(rows):
+            raise ValueError("Vertex coordinates and vertex_2_wedges must have matching lengths.")
+        if not np.all(np.isfinite(vertices)):
+            raise ValueError("Vertex coordinates contain NaN/Inf.")
+
+        # Quantize in the geometry dtype, matching the edge preprocessing.
+        tol = tf.cast(tolerance, self._vertices.dtype)
+        keys = tf.cast(tf.round(self._vertices / tol), tf.int64).numpy()
+
+        seen = {}
+        cleaned = []
+        removed = 0
+
+        for key, wedges in zip(keys, rows):
+            used = seen.setdefault(tuple(key), set())
+            unique_wedges = []
+
+            for wedge in wedges:
+                if wedge < 0:
+                    continue
+                if wedge in used:
+                    removed += 1
+                    continue
+
+                used.add(wedge)
+                unique_wedges.append(wedge)
+
+            cleaned.append(unique_wedges)
+
+        self.vertex_2_wedges = tf.ragged.constant(
+            cleaned, dtype=self.vertex_2_wedges.dtype, ragged_rank=1
+        )
+        print(f"Removed {removed} duplicate vertex-wedge contributions.")
 
     def set_active_objects_dd(self, object_names):
         self.active_objects_dd = tf.fill([len(self.ids)], False)
@@ -306,19 +373,20 @@ class ObjectsGeometry:
         _vertices = mi_to_tf_tensor(_vertices, dtype=self._rdtype)
         _facets = np.array(self.solver_paths._mi_scene.shapes()[obj_id].face_indices(dr.arange(mi.UInt32, num_facets)))
 
-        _vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, _wedge_2_adj_wedges = \
+        _vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets = \
                             get_data_types(_vertices, _facets, facet_2_wedges)
 
+        # Keep the seven-slot pickle layout; the removed adjacency slot is None.
         if self.is_double_diffraction:
             _dd_wedges = self._get_dd_wedges(facet_2_wedges, _facet_2_adj_facets, _wedge_2_facets)
             _dd_wedge_vertex = self._get_dd_edge_vertex(facet_2_wedges, _facets, _wedge_2_vertices)
             with open(out_filename, "wb") as f:
-                pickle.dump((_vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, _wedge_2_adj_wedges,
+                pickle.dump((_vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, None,
                             _dd_wedges, _dd_wedge_vertex), f)
         
         else:
             with open(out_filename, "wb") as f:
-                pickle.dump((_vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, _wedge_2_adj_wedges,
+                pickle.dump((_vertex_2_wedges, _wedge_2_facets, _wedge_2_vertices, _facet_2_adj_facets, None,
                              None, None), f)
 
     def _get_dd_edge_vertex(self, facets_2_wedges, facets, wedge_2_vertices):
@@ -561,221 +629,118 @@ def slab_transmission_coefficient(
         Relative TM transmission coefficient.
     """
 
-    real_dtype = dtype.real_dtype
-
-    eta = tf.cast(eta, dtype)
-    thickness = tf.cast(thickness, real_dtype)
-    wavelength = tf.cast(wavelength, real_dtype)
-
-    cos_theta_i = tf.cast(cos_theta_i, real_dtype)
-    cos_theta_i = tf.clip_by_value(
-        cos_theta_i,
-        tf.cast(0.0, real_dtype),
-        tf.cast(1.0, real_dtype)
+    _, _, t_s, t_p = slab_coefficients(
+        eta, cos_theta_i, thickness, wavelength, dtype=dtype
     )
-
-    # Avoid divisions by zero at exactly grazing incidence
-    eps = tf.cast(1e-7, real_dtype)
-    cos_theta_i_safe = tf.maximum(cos_theta_i, eps)
-
-    sin_theta_i_sq = tf.maximum(
-        tf.cast(0.0, real_dtype),
-        tf.cast(1.0, real_dtype) - cos_theta_i**2
-    )
-
-    k0 = tf.cast(2.0 * PI, real_dtype) / wavelength
-
-    # Normalized longitudinal wavenumbers:
-    # q_1 = k_z1 / k0 in air
-    # q_2 = k_z2 / k0 in the slab
-    q_1 = tf.cast(cos_theta_i_safe, dtype)
-    q_2 = tf.sqrt(
-        eta - tf.cast(sin_theta_i_sq, dtype)
-    )
-
-    # Select the passive branch for the exp(-j*k_z*z) convention.
-    # A lossy medium must have Im(q_2) <= 0.
-    q_2 = tf.where(
-        tf.math.imag(q_2) > 0.0,
-        -q_2,
-        q_2
-    )
-
-    # Normalized wave admittances.
-    #
-    # TE:
-    #   Y_s proportional to k_z
-    #
-    # TM:
-    #   Y_p proportional to epsilon / k_z
-    y_1_s = q_1
-    y_2_s = q_2
-
-    y_1_p = tf.math.reciprocal(q_1)
-    y_2_p = eta / q_2
-
-    def _slab_coefficient(y_1, y_2):
-        """Compute the slab coefficient for one polarization."""
-
-        # Transmission through the first interface
-        t_12 = 2.0 * y_1 / (y_1 + y_2)
-
-        # Transmission through the second interface
-        t_23 = 2.0 * y_2 / (y_2 + y_1)
-
-        # Internal reflection coefficients
-        r_21 = (y_2 - y_1) / (y_2 + y_1)
-        r_23 = r_21
-
-        # Propagation through the slab along its normal coordinate
-        propagation = tf.exp(
-            -1j
-            * tf.cast(k0 * thickness, dtype)
-            * q_2
-        )
-
-        # Absolute transmission between the two slab interfaces
-        t_abs = (
-            t_12
-            * t_23
-            * propagation
-            / (
-                1.0
-                - r_21
-                * r_23
-                * propagation**2
-            )
-        )
-
-        # Remove the phase that the RT solver already assigns to the
-        # corresponding air-filled region between the same planes
-        air_normalization = tf.exp(
-            1j
-            * tf.cast(k0 * thickness, dtype)
-            * q_1
-        )
-
-        return t_abs * air_normalization
-
-    t_s = _slab_coefficient(y_1_s, y_2_s)
-    t_p = _slab_coefficient(y_1_p, y_2_p)
-
     return t_s, t_p
 ####
     
 
-def get_data_types(vertices, faces, primitives_2_wedges): # for an object
-    num_vertices = len(vertices)
-    num_faces = len(faces)
-    num_wedges = tf.math.reduce_max(primitives_2_wedges) + 1
+def get_data_types(vertices, faces, primitives_2_wedges):
+    """Build per-object connectivity in NumPy, then convert the dense tables.
 
-    face_adjacency, adj_edges = trimesh.graph.face_adjacency(faces, return_edges=True)
+    Parameters
+    ----------
+    vertices : array or tf.Tensor, shape [num_vertices, 3]
+        Mesh vertices. Only their number is needed for connectivity.
+    faces : array, shape [num_faces, 3]
+        Triangles expressed using local vertex indices.
+    primitives_2_wedges : array or tf.Tensor, shape [num_faces, 3]
+        Existing global wedge IDs for each local triangle edge; -1 denotes
+        an edge which is not retained as a diffraction wedge.
 
-    vertex_2_wedges = [[] for _ in range(num_vertices)]  # ragged
-    wedge_2_facets = -1 * tf.ones([num_wedges, 2], dtype=tf.int32)
-    wedge_2_vertices = -1 * tf.ones([num_wedges, 2], dtype=tf.int32)
+    Returns
+    -------
+    vertex_2_wedges : list of lists
+        Incident global wedge IDs, preserving the previous insertion order.
+    wedge_2_facets : tf.Tensor, int32, shape [max_wedge_id + 1, 2]
+        Local adjacent facet IDs, or -1 for missing entries.
+    wedge_2_vertices : tf.Tensor, int32, shape [max_wedge_id + 1, 2]
+        Local endpoint vertex IDs, or -1 for missing entries.
+    facet_2_adj_facets : list of lists
+        [adjacent facet, shared wedge] entries in Trimesh adjacency order.
 
-    facet_2_adj_facets = [[] for _ in range(num_faces)]   # TODO: tf
-
-    facet_central_point = tf.reduce_mean(tf.gather(vertices, tf.convert_to_tensor(faces, dtype=tf.int32)), axis=1)  # [num_faces, 3]
-    count = 0 # will be equal to the number of wedges
-
-    for i in range(len(face_adjacency)):
-        vertex1_idx, vertex2_idx = adj_edges[i][0], adj_edges[i][1]
-        face1_idx, face2_idx = face_adjacency[i][0], face_adjacency[i][1]
-        
-        _common_wedge_idx = set(primitives_2_wedges[face1_idx].numpy()).intersection(set(primitives_2_wedges[face2_idx].numpy()))
-    
-        if len(_common_wedge_idx) == 0: 
-            print("ERROR No common:", primitives_2_wedges[face1_idx].numpy(), primitives_2_wedges[face2_idx].numpy())
-            continue
-
-        common_wedge_idx = max(list(_common_wedge_idx))
-
-        facet_2_adj_facets[face1_idx].append([face2_idx, common_wedge_idx])  # [adj_facet_idx, wedge_idx]
-        facet_2_adj_facets[face2_idx].append([face1_idx, common_wedge_idx])
-
-        if common_wedge_idx == -1:
-            continue
-
-        count += 1
-        wedge_2_facets = tf.tensor_scatter_nd_update(wedge_2_facets, [[common_wedge_idx, 0]], [face1_idx])
-        wedge_2_facets = tf.tensor_scatter_nd_update(wedge_2_facets, [[common_wedge_idx, 1]], [face2_idx])
-
-        vertex_2_wedges[vertex1_idx].append(common_wedge_idx)
-        vertex_2_wedges[vertex2_idx].append(common_wedge_idx)
-
-        wedge_2_vertices = tf.tensor_scatter_nd_update(wedge_2_vertices, [[common_wedge_idx, 0]], [vertex1_idx])
-        wedge_2_vertices = tf.tensor_scatter_nd_update(wedge_2_vertices, [[common_wedge_idx, 1]], [vertex2_idx])
-
-    wedge_2_adj_wedges = [[] for _ in range(num_wedges)]
-    for vertex_idx in range(num_vertices):
-        wedge_idxs = vertex_2_wedges[vertex_idx]
-        for i in range(len(wedge_idxs)):
-            for j in range(len(wedge_idxs)):
-                if i == j:
-                    continue
-
-                wedge1_idx, wedge2_idx = wedge_idxs[i], wedge_idxs[j]
-                if wedge1_idx == -1:
-                    continue
-
-                wedge_2_adj_wedges[wedge1_idx].append([wedge2_idx, vertex_idx])  # [adj_wedge_idx, vertex_idx]
-
-    ####
+    Notes
+    -----
+    Trimesh adjacency, boundary-edge grouping, global IDs, and the original
+    shared-wedge selection rule are retained. The unused wedge-to-adjacent-
+    wedges table is no longer constructed or returned. Geometry coordinates
+    and the differentiable _update_geometry() graph are not modified.
+    """
+    num_vertices = int(vertices.shape[0])
     faces_np = np.asarray(faces)
+    if hasattr(primitives_2_wedges, "numpy"):
+        primitives_2_wedges = primitives_2_wedges.numpy()
+    wedge_map = np.asarray(primitives_2_wedges, dtype=np.int32)
+    if faces_np.ndim != 2 or faces_np.shape[1] != 3:
+        raise ValueError("faces must have shape [num_faces, 3].")
+    if wedge_map.shape != faces_np.shape:
+        raise ValueError("primitives_2_wedges must have shape [num_faces, 3].")
+    num_faces = len(faces_np)
+    num_wedges = int(np.max(wedge_map, initial=-1)) + 1
+    vertex_2_wedges = [[] for _ in range(num_vertices)]
+    facet_2_adj_facets = [[] for _ in range(num_faces)]
+    wedge_2_facets = np.full((num_wedges, 2), -1, dtype=np.int32)
+    wedge_2_vertices = np.full((num_wedges, 2), -1, dtype=np.int32)
 
-    local_edges = np.array([
-        [0, 1],
-        [1, 2],
-        [2, 0],
-    ])
+    face_adjacency, adj_edges = trimesh.graph.face_adjacency(faces_np, return_edges=True)
+    # Match the old max(set(left).intersection(right)) rule, including -1.
+    left = wedge_map[face_adjacency[:, 0]]
+    right = wedge_map[face_adjacency[:, 1]]
+    shared_entries = np.any(left[:, :, None] == right[:, None, :], axis=2)
+    has_common = np.any(shared_entries, axis=1)
+    common = np.max(np.where(shared_entries, left, -1), axis=1)
+    for index in np.flatnonzero(~has_common):
+        print("ERROR No common:", left[index], right[index])
 
-    # All face edges: [num_faces * 3, 2]
+    for adjacent, endpoints, wedge in zip(face_adjacency[has_common], adj_edges[has_common], common[has_common]):
+        face1, face2 = int(adjacent[0]), int(adjacent[1])
+        wedge = int(wedge)
+        facet_2_adj_facets[face1].append([face2, wedge])
+        facet_2_adj_facets[face2].append([face1, wedge])
+        if wedge >= 0:
+            vertex_2_wedges[int(endpoints[0])].append(wedge)
+            vertex_2_wedges[int(endpoints[1])].append(wedge)
+
+    def assign_last(table, wedge_ids, values):
+        # Repeated global IDs must retain the last update, as in the old loop.
+        if len(wedge_ids) == 0:
+            return
+        _, first_from_end = np.unique(wedge_ids[::-1], return_index=True)
+        last = len(wedge_ids) - 1 - first_from_end
+        table[wedge_ids[last]] = values[last]
+
+    real_shared = has_common & (common >= 0)
+    assign_last(wedge_2_facets, common[real_shared], face_adjacency[real_shared])
+    assign_last(wedge_2_vertices, common[real_shared], adj_edges[real_shared])
+
+    # Preserve the existing local edge order and boundary occurrence order.
+    local_edges = np.array([[0, 1], [1, 2], [2, 0]])
     all_face_edges = faces_np[:, local_edges].reshape(-1, 2)
-    all_face_edges_sorted = np.sort(all_face_edges, axis=1)
-
-    face_indices = np.repeat(np.arange(num_faces), 3)
-    local_edge_indices = np.tile(np.arange(3), num_faces)
-
     _, inverse, edge_counts = np.unique(
-        all_face_edges_sorted,
-        axis=0,
-        return_inverse=True,
-        return_counts=True,
+        np.sort(all_face_edges, axis=1), axis=0, return_inverse=True, return_counts=True
     )
+    boundary_occurrences = np.flatnonzero(edge_counts[inverse] == 1)
+    face_ids = boundary_occurrences // 3
+    local_edge_ids = boundary_occurrences % 3
+    boundary_wedges = wedge_map[face_ids, local_edge_ids]
+    real_boundary = boundary_wedges >= 0
+    face_ids = face_ids[real_boundary]
+    boundary_wedges = boundary_wedges[real_boundary]
+    boundary_vertices = all_face_edges[boundary_occurrences[real_boundary]]
+    for endpoints, wedge in zip(boundary_vertices, boundary_wedges):
+        vertex_2_wedges[int(endpoints[0])].append(int(wedge))
+        vertex_2_wedges[int(endpoints[1])].append(int(wedge))
+    assign_last(wedge_2_vertices, boundary_wedges, boundary_vertices)
+    # A boundary update sets only the first face, preserving the previous second face.
+    if len(boundary_wedges):
+        _, first_from_end = np.unique(boundary_wedges[::-1], return_index=True)
+        last = len(boundary_wedges) - 1 - first_from_end
+        wedge_2_facets[boundary_wedges[last], 0] = face_ids[last]
 
-    boundary_occurrences = np.where(edge_counts[inverse] == 1)[0]
-
-    for occurrence in boundary_occurrences:
-        face_idx = face_indices[occurrence]
-        local_edge_idx = local_edge_indices[occurrence]
-
-        vertex1_idx, vertex2_idx = all_face_edges[occurrence]
-
-        # Assumes primitives_2_wedges[f, e] corresponds to local face edge e
-        wedge_idx = int(primitives_2_wedges[face_idx, local_edge_idx])
-
-        if wedge_idx == -1:
-            continue
-
-        vertex_2_wedges[vertex1_idx].append(wedge_idx)
-        vertex_2_wedges[vertex2_idx].append(wedge_idx)
-
-        wedge_2_vertices = tf.tensor_scatter_nd_update(
-            wedge_2_vertices,
-            [[wedge_idx, 0], [wedge_idx, 1]],
-            [vertex1_idx, vertex2_idx],
-        )
-
-        # Boundary wedge has only one adjacent facet
-        wedge_2_facets = tf.tensor_scatter_nd_update(
-            wedge_2_facets,
-            [[wedge_idx, 0]],
-            [face_idx],
-        )
-        #####
-
-    return vertex_2_wedges, wedge_2_facets, wedge_2_vertices, facet_2_adj_facets, wedge_2_adj_wedges
-
-
+    return (
+        vertex_2_wedges,
+        tf.convert_to_tensor(wedge_2_facets, dtype=tf.int32),
+        tf.convert_to_tensor(wedge_2_vertices, dtype=tf.int32),
+        facet_2_adj_facets,
+    )
